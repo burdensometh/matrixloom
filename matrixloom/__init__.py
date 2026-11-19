@@ -3,5 +3,7 @@ from .service import Analysis
 from .table import Table
 from .schema import Field, Schema
 from .frame import Frame
+from .migration import migrate_inventory, migrate_bundle_files, verify_inventory
 
-__all__ = ["Analysis", "Table", "Field", "Schema", "Frame"]
+__all__ = ["Analysis", "Table", "Field", "Schema", "Frame",
+           "migrate_inventory", "migrate_bundle_files", "verify_inventory"]

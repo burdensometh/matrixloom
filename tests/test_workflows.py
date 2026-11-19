@@ -86,7 +86,11 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(StateError):
             self.app.store.import_bundle("tampered", json.dumps(envelope))
         connection = self.app.store.connect()
-        connection.execute("UPDATE samples SET weight=999 WHERE dataset_name='training' AND sample_id='r00'")
+        row = connection.execute("SELECT payload FROM sample_blocks WHERE dataset_name='training' LIMIT 1").fetchone()
+        payload = json.loads(row["payload"])
+        payload["weights"][0] = 999
+        connection.execute("UPDATE sample_blocks SET payload=? WHERE dataset_name='training' AND block_index=?",
+                           (json.dumps(payload, sort_keys=True, separators=(",", ":")), payload["index"]))
         connection.close()
         with self.assertRaises(StateError):
             self.app.store.load_table("training")

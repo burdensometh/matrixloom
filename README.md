@@ -50,7 +50,7 @@ analysis.train("model", "observations", {"fields": ["x"]}, {"kind": "ridge", "al
 predictions = analysis.predict("model", "observations")
 ```
 
-`Analysis.evaluate` persists an identity-bound evaluation; `classify` provides probability metrics; `compare`, `importance`, and `cluster_quality` consume actual model outputs. Prediction and regression scoring can read input data in batches, while fitted neighbor training data and dense preprocessing states remain in-memory structures in version 1.
+`Analysis.evaluate` persists an identity-bound evaluation; `classify` provides probability metrics; `compare`, `importance`, and `cluster_quality` consume actual model outputs. Prediction and regression scoring can read input data in batches, while fitted neighbor training data and dense preprocessing states remain in-memory structures once loaded.
 
 Random, stratified, temporal, and k-fold split constructors are available. `holdout` fits only its selected training rows. Bootstrap means assume independent observations. Unconditional permutation importance is descriptive and is not a grouped or causal estimate. Neighbor intervals are empirical summaries and have no coverage guarantee.
 
@@ -59,5 +59,28 @@ Random, stratified, temporal, and k-fold split constructors are available. `hold
 `Store` retains immutable dataset and model revisions. A dataset revision freezes schema, order, sample identities, values, weights, and digest. Model bundles bind the fitted preprocessing state and estimator state; optional dataset binding verifies the training digest. Evaluation ids are idempotent only for the same model, dataset revision, population, predictions, and metrics.
 
 Version 1 stores sample rows as JSON arrays in SQLite and exports model bundles as a versioned JSON envelope. Bundle import validates its digest and reconstructs supported numerical states; it does not execute pickles or arbitrary code. Full table loading verifies its digest. Batched and selected-row reads validate structure and population but do not independently recompute the full dataset digest.
+
+### Format version 2: column blocks
+
+New datasets and bundles are written in format version 2. A dataset revision is stored as ordered, checksummed column blocks (`sample_blocks`) rather than one JSON array per sample. Every block records its sample order (`sample_ids`, `first_row`), the identity of every column (`column_ids`), the per-column missing mask (`missing`, `0` observed / `1` missing), the sample weights, and a SHA-256 digest over the block body. The schema, row count, and whole-population digest remain on the revision header.
+
+A fitted model's embedded neighbor training matrix is stored the same way: a `matrixloom-frame-blocks` envelope with the same sample order, feature identities, missing mask, and weights. Digests identify logical content, not encoding, so a bundle's digest, its training digest, its bound dataset digest, and its evaluation digests are unchanged by the encoding. Nothing is refitted.
+
+Reads accept both formats. Version 1 revisions are served from the legacy `samples` table; version 2 revisions are decoded block by block and validated (checksums, feature identity, mask/value agreement, contiguous coverage). `Store.legacy(path)` opens a version 1 inventory read-only, and `Store(path).read_only=True` prevents accidental writes.
+
+Writes are interruption-safe. `save_table` first commits the revision header unpublished, then commits blocks one at a time, then verifies the decoded population against the source digest and publishes in a final transaction. An interrupted write leaves an unpublished draft that readers cannot see (`Store.drafts()` lists them) and a rerun of the same `save_table` resumes it. Bundle payloads are replaced in a single transaction.
+
+### Migrating a version 1 inventory
+
+`migrate_inventory(source, destination=None, block_rows=256)` converts every version 1 dataset revision and bundle in place (or into a copied destination file), never refitting. Each table is decoded, re-encoded as blocks, decoded again, and compared on schema, sample order, weights, and digest before its revision is published and its legacy rows removed in one transaction. Each bundle's training matrix is converted with its logical digest preserved, and each evaluation record is retained as stored.
+
+`verify_inventory(legacy, migrated)` reopens both sides and checks that every table digest and population, every model digest, every prediction over its bound dataset revision, and every historical evaluation record are identical. `migrate_bundle_files(source_dir, destination_dir)` converts exported JSON envelopes. The console command is:
+
+```sh
+matrixloom-migrate fixtures/v1/analysis.sqlite /tmp/matrixloom-v2/analysis.sqlite
+```
+
+Without a destination the inventory is migrated in place after the original is snapshotted for verification.
+
 
 The tests include hand-computed matrix solutions, weighted-population checks, identity reordering, missing-data populations, serialization round trips, corruption rejection, fitted-state isolation, and end-to-end reopen/evaluation workflows.

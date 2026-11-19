@@ -9,5 +9,8 @@ description = "Typed sample matrices, fitted features, and reproducible numerica
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+matrixloom-migrate = "matrixloom.migration:main"
+
 [tool.setuptools.packages.find]
 include = ["matrixloom*"]
