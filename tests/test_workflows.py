@@ -31,6 +31,10 @@ def observations():
 SPEC = {"fields": ["x", "z", "category"], "unknown": "zero",
         "transforms": [{"kind": "impute"}, {"kind": "standardize"}]}
 
+NEIGHBOR_SPEC = {"fields": ["x", "z", "category"], "unknown": "zero",
+                 "transforms": [{"kind": "neighbor_impute", "neighbors": 3},
+                                {"kind": "standardize"}]}
+
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -155,6 +159,72 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.app.store.load_table("json").digest(), self.app.store.load_table("csv").digest())
         self.app.ingest("metric-units", self.table, units={"x": "m"})
         self.assertEqual(self.app.store.load_table("metric-units").schema.field("x").unit, "m")
+
+    def test_neighbor_imputation_enters_prediction_chain_and_reopens(self):
+        result = self.app.train("knn-fill", "training", NEIGHBOR_SPEC,
+                                {"kind": "ridge", "alpha": .1}, "y")
+        initial = self.app.predict("knn-fill", "training")
+        bundle = self.app.store.load_bundle("knn-fill")
+        # The donor store and training-only scales are part of the persisted bundle.
+        stage = bundle.features.stages[0]
+        self.assertEqual(stage.kind, "neighbor_impute")
+        self.assertEqual(stage.donors.ids, self.table.ids())
+        reopened = Analysis(self.app.home)
+        reloaded = reopened.store.load_bundle("knn-fill")
+        self.assertEqual(reloaded.predict(self.table), initial)
+        self.assertEqual(restore_bundle(reloaded.state()).digest(), bundle.digest())
+        # Export/import keeps the donor provenance working end to end.
+        text = self.app.store.export_bundle("knn-fill")
+        self.app.store.import_bundle("knn-copy", text)
+        self.assertEqual(self.app.predict("knn-copy", "training"), initial)
+        # Prediction never updates training statistics: repeated prediction is identical.
+        self.assertEqual(reloaded.predict(self.table), reloaded.predict(self.table))
+        # Provenance is reachable through the feature pipeline and names original donors.
+        sources = bundle.features.fill_sources(self.table)
+        self.assertIn("z", sources["r03"])
+        self.assertEqual(sources["r03"]["z"]["strategy"], "neighbors")
+        self.assertTrue(all(donor["id"] in set(self.table.ids())
+                            for donor in sources["r03"]["z"]["donors"]))
+        self.assertNotIn("y", sources["r03"])
+        # The original observations are immutable across repeated transforms.
+        encoded_first = bundle.features.transform(self.table)
+        encoded_second = bundle.features.transform(self.table)
+        self.assertEqual(encoded_first.state(), encoded_second.state())
+        self.assertEqual(result["revision"], 1)
+
+    def test_neighbor_imputation_uses_original_mask_and_feeds_clusterer(self):
+        # b is missing x1; its nearest donor on the originally shared x0 dimension is c.
+        schema = Schema([Field("x0", "X0"), Field("x1", "X1"),
+                         Field("label", "Label", "integer", role="target")])
+        rows = [Sample("a", (-3.0, 99.0, 0)), Sample("b", (0.0, None, 0)),
+                Sample("c", (1.0, 10.0, 1)), Sample("d", (2.0, 20.0, 1))]
+        table = Table(schema, rows)
+        self.app.ingest("sparse", table)
+        spec = {"fields": ["x0", "x1"],
+                "transforms": [{"kind": "neighbor_impute", "neighbors": 1,
+                                "distance_weighted": False}]}
+        predictor = Predictor(spec, {"kind": "ridge", "alpha": 0.0}, "label").fit(table)
+        source = predictor.features.fill_sources(table)["b"]["x1"]
+        self.assertEqual([donor["id"] for donor in source["donors"]], ["c"])
+        self.assertEqual(source["value"], 10.0)
+        # Replaying the fill on the now-complete frame with the original mask reproduces
+        # the identical values and provenance: imputed entries never become observations.
+        imputer = predictor.features.stages[0]
+        encoded = predictor.features.encoder.transform(table)
+        original_mask = [[value is not None for value in row] for row in encoded.values]
+        filled = imputer.transform(encoded)
+        replayed = imputer.transform_with_mask(filled, original_mask)
+        self.assertEqual(replayed.values, filled.values)
+        replay_sources = imputer.fill_sources(filled, original_mask)
+        self.assertEqual([donor["id"] for donor in replay_sources["b"]["x1"]["donors"]], ["c"])
+        self.assertEqual(replay_sources["b"]["x1"]["value"], source["value"])
+        self.assertIsNone(table.sample("b").values[1])
+        # The same imputation stage supports the unsupervised prediction chain as well.
+        clustered = self.app.cluster("sparse-clusters", "sparse", spec,
+                                     {"kind": "kmeans", "clusters": 2})
+        self.assertEqual(len(clustered["assignments"]), len(table))
+        self.assertEqual(Analysis(self.app.home).predict("sparse-clusters", "sparse"),
+                         clustered["assignments"])
 
     def test_failure_keeps_previous_fitted_state(self):
         predictor = Predictor(SPEC, {"kind": "ridge"}, "y").fit(self.table)

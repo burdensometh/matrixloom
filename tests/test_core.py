@@ -10,7 +10,7 @@ from matrixloom.encoding import Encoder
 from matrixloom import linalg as la
 from matrixloom import statistics as stats
 from matrixloom import metrics
-from matrixloom.transforms import (Imputer, Standardizer, RangeScaler, Winsorizer,
+from matrixloom.transforms import (Imputer, NeighborImputer, Standardizer, RangeScaler, Winsorizer,
                                    Polynomial, FeatureSelector, restore_transform, create_transform)
 from matrixloom.expressions import Derivations, Expression
 from matrixloom.estimators import Ridge, Neighbors, KMeans, Logistic, create_model, restore_model
@@ -165,6 +165,95 @@ class FeatureTests(unittest.TestCase):
             output = stage.fit_transform(f)
             self.assertEqual(restore_transform(stage.state()).transform(f).state(), output.state())
         self.assertEqual(create_transform({"kind": "impute"}).kind, "impute")
+
+    def test_neighbor_imputation_distances_scales_and_ties(self):
+        # Two donors, equal weights: population sd of x0 is 1, of x1 is 50.
+        donor_frame = Frame(["d1", "d2"], [Feature("x0", "x0"), Feature("x1", "x1")],
+                            [[0, 100], [2, 200]])
+        imputer = NeighborImputer(neighbors=2, distance_weighted=True).fit(donor_frame)
+        self.assertEqual(imputer.scales, (1.0, 50.0))
+        query = Frame(["q"], donor_frame.features, [[0.5, None]])
+        # distances over the single shared dimension: 0.25 and 2.25;
+        # inverse-distance weights 4 and 4/9 -> 90% of d1, 10% of d2 -> 110.
+        self.assertAlmostEqual(imputer.transform(query).values[0][1], 110)
+        plain = NeighborImputer(neighbors=2, distance_weighted=False).fit(donor_frame)
+        self.assertEqual(plain.transform(query).values[0][1], 150)
+        # Equal distances give equal aggregation weight.
+        self.assertEqual(imputer.transform(Frame(["q"], donor_frame.features, [[1, None]])).values[0][1], 150)
+        # Exact-match donor: distance zero collapses the donor set.
+        source = imputer.fill_sources(Frame(["q"], donor_frame.features, [[0, None]]))["q"]["x1"]
+        self.assertEqual([item["id"] for item in source["donors"]], ["d1"])
+        self.assertEqual(source["donors"][0]["distance"], 0.0)
+        self.assertEqual(source["value"], 100)
+        # Original observations must never be rewritten.
+        self.assertEqual(imputer.transform(Frame(["q"], donor_frame.features, [[0.5, 123]])).values[0][1], 123)
+        # Stable sample-id tie breaking at equal distance.
+        tied = Frame(["b", "a", "c"], [Feature("x0", "x0"), Feature("x1", "x1")],
+                     [[0, 1], [2, 3], [4, 5]])
+        single = NeighborImputer(neighbors=1).fit(tied)
+        picked = single.fill_sources(Frame(["q"], tied.features, [[1, None]]))["q"]["x1"]
+        self.assertEqual(picked["donors"][0]["id"], "a")
+        self.assertAlmostEqual(picked["donors"][0]["distance"], 0.375)
+
+    def test_neighbor_imputation_masks_fallbacks_and_state(self):
+        donors = Frame(["d1", "d2", "zero"], [Feature("x0", "x0"), Feature("x1", "x1")],
+                       [[0, None], [2, 200], [9, 9]], [1, 1, 0])
+        imputer = NeighborImputer(neighbors=5, min_common=2).fit(donors)
+        # No shared dimension survives min_common: every fill is a training-mean fallback.
+        sources = imputer.fill_sources(Frame(["q"], donors.features, [[None, None]]))["q"]
+        self.assertEqual(sources["x0"]["strategy"], "fallback")
+        self.assertEqual(sources["x0"]["donors"], [])
+        self.assertEqual(sources["x0"]["value"], 1.0)
+        # Only d2 observes x1, so it is the sole legal donor for that column.
+        relaxed = NeighborImputer(neighbors=5).fit(donors)
+        picked = relaxed.fill_sources(Frame(["q"], donors.features, [[1, None]]))["q"]["x1"]
+        self.assertEqual([item["id"] for item in picked["donors"]], ["d2"])
+        self.assertNotIn("zero", [item["id"] for item in picked["donors"]])
+        # Constant fallback and an entirely unobserved training column both land on empty_value.
+        constant = NeighborImputer(neighbors=5, min_common=2, fallback="constant",
+                                   empty_value=-7).fit(donors)
+        self.assertEqual(constant.transform(Frame(["q"], donors.features, [[None, None]])).values[0][0], -7)
+        empty = NeighborImputer(empty_value=-9).fit(Frame(["p"], donors.features, [[1, None]]))
+        self.assertEqual(empty.fallback_fill, (1.0, -9.0))
+        # Provenance round-trips; restored imputers must produce identical fills and sources.
+        restored = restore_transform(imputer.state())
+        query = Frame(["q"], donors.features, [[None, None]])
+        self.assertEqual(restored.transform(query).state(), imputer.transform(query).state())
+        self.assertEqual(restored.fill_sources(query), imputer.fill_sources(query))
+        self.assertEqual(restored.state(), imputer.state())
+        # Indicators follow the same axis rule as mean imputation.
+        indicated = NeighborImputer(indicators=True).fit(
+            Frame(["d1", "d2"], [Feature("x0", "x0"), Feature("x1", "x1")], [[0, 100], [2, 200]]))
+        indicated_values = indicated.transform(
+            Frame(["q"], indicated.features, [[0.5, None]])).values[0]
+        self.assertAlmostEqual(indicated_values[1], 110)
+        self.assertEqual(indicated_values[2:], (0.0, 1.0))
+        for kwargs in ({"neighbors": 0}, {"min_common": 0}, {"fallback": "median"}):
+            with self.assertRaises(SchemaError):
+                NeighborImputer(**kwargs)
+        with self.assertRaises(SchemaError):
+            NeighborImputer(min_common=3).fit(donors)
+        self.assertEqual(create_transform({"kind": "neighbor_impute"}).kind, "neighbor_impute")
+
+    def test_neighbor_imputation_explicit_observation_mask(self):
+        donor_frame = Frame(["d1", "d2"], [Feature("x0", "x0"), Feature("x1", "x1")],
+                            [[0.0, 0.0], [4.0, 8.0]])
+        imputer = NeighborImputer(neighbors=1, distance_weighted=False).fit(donor_frame)
+        self.assertEqual(imputer.scales, (2.0, 4.0))
+        # The frame is already complete, but an explicit mask declares x1 unobserved:
+        # distances use x0 only (mean over the single common dimension), and the declared
+        # gap is recomputed even though a value currently sits in the cell.
+        complete = Frame(["q"], donor_frame.features, [[3.0, 99.0]])
+        mask = [[True, False]]
+        filled = imputer.transform_with_mask(complete, mask)
+        self.assertEqual(filled.values, ((3.0, 8.0),))
+        source = imputer.fill_sources(complete, mask)["q"]["x1"]
+        self.assertEqual(source["donors"][0]["id"], "d2")
+        self.assertAlmostEqual(source["donors"][0]["distance"], 0.25)
+        # The same frame without a mask has no fill targets, so nothing changes.
+        self.assertEqual(imputer.transform(complete).values, ((3.0, 99.0),))
+        with self.assertRaises(SchemaError):
+            imputer.transform_with_mask(complete, [[True]])
 
     def test_expressions_are_numeric_and_bounded(self):
         schema = Schema([Field("x", "X"), Field("y", "Y")])

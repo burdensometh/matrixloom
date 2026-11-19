@@ -96,6 +96,194 @@ class Imputer(Transform):
         return result
 
 
+class NeighborImputer(Transform):
+    """Donor-based imputation over the original observation mask.
+
+    Distances are mean standardized squared differences over the dimensions observed
+    in both the query row and the donor. Scales are learned from the training frame
+    only; prediction never refits them. A donor for a missing column must observe that
+    column in the frozen training data, and donors only ever contribute their original
+    observations, so values filled by this stage cannot feed back into a distance.
+    """
+
+    kind = "neighbor_impute"
+
+    def __init__(self, neighbors=5, min_common=1, distance_weighted=True,
+                 fallback="mean", empty_value=0.0, indicators=False):
+        super().__init__()
+        if type(neighbors) is not int or neighbors < 1:
+            raise SchemaError("neighbor count must be a positive integer")
+        if type(min_common) is not int or min_common < 1:
+            raise SchemaError("minimum common dimension count must be a positive integer")
+        if type(distance_weighted) is not bool or type(indicators) is not bool:
+            raise SchemaError("neighbor imputation flags must be boolean")
+        if fallback not in {"mean", "constant"}:
+            raise SchemaError("unsupported neighbor imputation fallback")
+        self.neighbors = neighbors
+        self.min_common = min_common
+        self.distance_weighted = distance_weighted
+        self.fallback = fallback
+        self.empty_value = finite(empty_value)
+        self.indicators = indicators
+        self.scales = None
+        self.fallback_fill = None
+        self.donors = None
+
+    def fit(self, frame):
+        if self.min_common > frame.width:
+            raise SchemaError("minimum common dimensions cannot exceed the feature width")
+        scales = []
+        fallback_fill = []
+        for feature in frame.features:
+            column = frame.column(feature.id)
+            try:
+                scale = stats.standard_deviation(column, frame.weights)
+            except NumericalError:
+                scale = 0.0
+            scales.append(scale if scale > 0 else 1.0)
+            if self.fallback == "constant":
+                fallback_fill.append(self.empty_value)
+            else:
+                try:
+                    fallback_fill.append(stats.mean(column, frame.weights))
+                except NumericalError:
+                    fallback_fill.append(self.empty_value)
+        positive = frame.positive_population()
+        self._fit_axis(frame)
+        self.scales = tuple(scales)
+        self.fallback_fill = tuple(fallback_fill)
+        self.donors = positive
+        return self
+
+    def _distance(self, query, donor, query_mask, donor_mask):
+        total = 0.0
+        common = 0
+        for j in range(len(query)):
+            if not query_mask[j] or not donor_mask[j]:
+                continue
+            scaled = (query[j] - donor[j]) / self.scales[j]
+            total += scaled * scaled
+            common += 1
+        if common < self.min_common:
+            return None
+        return total / common
+
+    def _fill(self, frame, mask=None):
+        """Fill missing entries.
+
+        ``mask`` is the original observation matrix: True where a value was observed.
+        When it is supplied, unmasked positions are treated as fill targets even if
+        the frame currently holds a previously imputed value, and distances use the
+        mask rather than the frame's None pattern. Filled values therefore can never
+        be mistaken for real observations, and replaying a fill over its own output
+        reproduces the same values.
+        """
+        if mask is None:
+            mask = tuple(tuple(value is not None for value in row) for row in frame.values)
+        elif len(mask) != len(frame.values) or any(len(row) != frame.width for row in mask):
+            raise SchemaError("observation mask population differs from the frame")
+        values = []
+        sources = {}
+        donor_rows = dict(zip(self.donors.ids, self.donors.values))
+        weight_map = dict(zip(self.donors.ids, self.donors.weights))
+        donor_masks = {key: tuple(value is not None for value in row)
+                       for key, row in donor_rows.items()}
+        for sample_id, row, observed_mask in zip(frame.ids, frame.values, mask):
+            output = list(row)
+            for j, observed in enumerate(row):
+                if observed_mask[j]:
+                    continue
+                candidates = []
+                for donor_id, donor_row in donor_rows.items():
+                    if donor_row[j] is None:
+                        continue
+                    distance = self._distance(row, donor_row, observed_mask, donor_masks[donor_id])
+                    if distance is not None:
+                        candidates.append((distance, donor_id))
+                candidates.sort(key=lambda item: (item[0], item[1]))
+                chosen = candidates[:self.neighbors]
+                if not chosen:
+                    output[j] = self.fallback_fill[j]
+                    sources[(sample_id, frame.features[j].id)] = {
+                        "strategy": "fallback", "fallback": self.fallback,
+                        "value": self.fallback_fill[j], "donors": []}
+                    continue
+                if self.distance_weighted and any(distance == 0.0 for distance, _ in chosen):
+                    chosen = [(distance, donor_id) for distance, donor_id in chosen if distance == 0.0]
+                contributions = []
+                weights = []
+                for distance, donor_id in chosen:
+                    if self.distance_weighted and distance > 0.0:
+                        weight = weight_map[donor_id] / distance
+                    else:
+                        weight = weight_map[donor_id]
+                    contributions.append((donor_id, donor_rows[donor_id][j],
+                                          distance, weight_map[donor_id], weight))
+                    weights.append(weight)
+                total_weight = math.fsum(weights)
+                value = math.fsum(item[1] * (item[4] / total_weight) for item in contributions)
+                output[j] = value
+                sources[(sample_id, frame.features[j].id)] = {
+                    "strategy": "neighbors", "fallback": None, "value": value,
+                    "donors": [{"id": donor_id, "value": donor_value, "distance": distance,
+                                "sample_weight": sample_weight, "weight": weight}
+                               for donor_id, donor_value, distance, sample_weight, weight in contributions]}
+            values.append(output)
+        return values, sources
+
+    def transform(self, frame):
+        frame = self._check(frame)
+        features = frame.features
+        if self.indicators:
+            features += tuple(Feature("missing:" + canonical(f.id), f.id, "missing_indicator")
+                              for f in frame.features)
+        values, _ = self._fill(frame)
+        if self.indicators:
+            for output, row in zip(values, frame.values):
+                output.extend(float(value is None) for value in row)
+        return frame.with_values(values, features)
+
+    def transform_with_mask(self, frame, mask):
+        """Transform while treating ``mask`` (not the frame's Nones) as the original observations."""
+        frame = self._check(frame)
+        values, _ = self._fill(frame, mask)
+        return frame.with_values(values)
+
+    def fill_sources(self, frame, mask=None):
+        """Report the donor provenance of every missing entry without changing the frame."""
+        frame = self._check(frame)
+        _, sources = self._fill(frame, mask)
+        return {sample_id: {feature_id: dict(source)
+                            for (row_id, feature_id), source in sources.items() if row_id == sample_id}
+                for sample_id in frame.ids}
+
+    def state(self):
+        if self.donors is None:
+            raise NotFitted("cannot serialize an unfitted neighbor imputer")
+        return {**self._axis_state(), "neighbors": self.neighbors, "min_common": self.min_common,
+                "distance_weighted": self.distance_weighted, "fallback": self.fallback,
+                "empty_value": self.empty_value, "indicators": self.indicators,
+                "scales": list(self.scales), "fallback_fill": list(self.fallback_fill),
+                "donors": self.donors.state()}
+
+    @classmethod
+    def restore(cls, state):
+        result = cls(state["neighbors"], state["min_common"], state["distance_weighted"],
+                     state["fallback"], state["empty_value"], state["indicators"])
+        result._restore_axis(state)
+        result.scales = tuple(finite(x) for x in state["scales"])
+        result.fallback_fill = tuple(finite(x) for x in state["fallback_fill"])
+        donors = Frame.restore(state["donors"])
+        if donors.features != result.features:
+            raise StateError("neighbor imputer donor axis mismatch")
+        if len(result.scales) != len(result.features) or len(result.fallback_fill) != len(result.features):
+            raise StateError("neighbor imputer state width mismatch")
+        if any(x <= 0 for x in result.scales):
+            raise StateError("neighbor imputer scales must be positive")
+        result.donors = donors
+        return result
+
+
 class Standardizer(Transform):
     kind = "standardize"
 
@@ -341,7 +529,8 @@ class FeatureSelector(Transform):
         return result
 
 
-TRANSFORMS = {c.kind: c for c in (Imputer, Standardizer, RangeScaler, Winsorizer, Polynomial, FeatureSelector)}
+TRANSFORMS = {c.kind: c for c in (Imputer, NeighborImputer, Standardizer, RangeScaler,
+                                  Winsorizer, Polynomial, FeatureSelector)}
 
 
 def restore_transform(state):

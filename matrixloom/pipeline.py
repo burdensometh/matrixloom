@@ -51,6 +51,17 @@ class Features:
     def fit_transform(self, table):
         return self.fit(table).transform(table)
 
+    def fill_sources(self, table, mask=None):
+        """Donor provenance for the fitted neighbor imputation stage, if the pipeline has one."""
+        if self.encoder is None:
+            raise NotFitted("feature pipeline has not been fitted")
+        frame = self.encoder.transform(self.derivations.transform(table))
+        for stage in self.stages:
+            if stage.kind == "neighbor_impute":
+                return stage.fill_sources(frame, mask)
+            frame = stage.transform(frame)
+        return {}
+
     def fresh(self):
         return Features(**copy.deepcopy(self.spec))
 
