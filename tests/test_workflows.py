@@ -166,3 +166,96 @@ class WorkflowTests(unittest.TestCase):
         state["output_features"][0]["id"] = "changed"
         with self.assertRaises(StateError):
             Features.restore(state)
+
+    def test_streamed_covariance_matches_full_inspection_and_persists(self):
+        from matrixloom.statistics import CovarianceAccumulator, covariance_matrix
+        from matrixloom.frame import numerical_frame
+        fields = ["x", "z"]
+        full_frame = numerical_frame(self.table, fields)
+        expected = covariance_matrix(full_frame, ddof=1, pairwise=True)
+
+        streamed = self.app.covariance_profile("streamed", "training", fields, ddof=1,
+                                               pairwise=True, size=3, save="cov-1")
+        self.assertEqual(streamed["population"], "pairwise")
+        self.assertEqual(streamed["support"], expected["support"])
+        for i in range(2):
+            for j in range(2):
+                if expected["covariance"][i][j] is None:
+                    self.assertIsNone(streamed["covariance"][i][j])
+                else:
+                    self.assertAlmostEqual(streamed["covariance"][i][j],
+                                           expected["covariance"][i][j])
+        self.assertEqual(streamed["saved"]["name"], "cov-1")
+        self.assertEqual(streamed["saved"]["revision"], 1)
+        info = self.app.store.covariance_info("cov-1")
+        self.assertEqual(info["dataset_name"], "training")
+        self.assertEqual(info["features"], ["x", "z"])
+        self.assertEqual(info["ddof"], 1)
+        reopened = Analysis(self.app.home)
+        restored = reopened.store.load_covariance("cov-1")
+        self.assertIsInstance(restored, CovarianceAccumulator)
+        self.assertEqual(restored.result()["support"], expected["support"])
+        self.assertEqual(restored.training_digest, self.table.digest())
+        self.assertEqual(len(reopened.store.revisions("cov-1", "covariance")), 1)
+        # raw sample rows are never copied into the covariance state table
+        connection = reopened.store.connect()
+        payload = connection.execute(
+            "SELECT payload FROM covariance_states WHERE name='cov-1'").fetchone()[0]
+        connection.close()
+        self.assertNotIn("r00", payload)
+        self.assertNotIn("sample", payload)
+
+    def test_covariance_revision_binding_and_diagnostic_reuse(self):
+        from matrixloom.diagnostics import collinearity_profile
+        from matrixloom.statistics import covariance_matrix
+        from matrixloom.frame import numerical_frame
+        fields = ["x", "z"]
+        self.app.covariance_profile("p", "training", fields, size=4, save="cov")
+        # merged covariance state still feeds the existing feature diagnostic
+        profile = self.app.collinearity_profile("cov")
+        in_memory = collinearity_profile(
+            covariance_matrix(numerical_frame(self.table, fields), pairwise=True))
+        self.assertEqual(profile["status"], in_memory["status"])
+        self.assertEqual(set(profile["vif"]), set(in_memory["vif"]))
+        for key in profile["vif"]:
+            self.assertAlmostEqual(profile["vif"][key], in_memory["vif"][key], places=6)
+        self.assertAlmostEqual(profile["condition"], in_memory["condition"], places=6)
+        # binding enforces the frozen dataset revision digest
+        from matrixloom.errors import StateError as StoreStateError
+        tampered = self.app.store.load_covariance("cov")
+        tampered.training_digest = "different"
+        with self.assertRaises(StoreStateError):
+            self.app.store.save_covariance("bad", tampered, ("training", 1))
+        # optimistic revision checks still apply to the new namespace
+        next_revision = self.app.store.save_covariance("cov",
+                             self.app.store.load_covariance("cov"),
+                             ("training", 1), expected_revision=1)
+        self.assertEqual(next_revision["revision"], 2)
+
+    def test_streamed_covariance_merges_batches_in_any_order(self):
+        from matrixloom.statistics import CovarianceAccumulator
+        from matrixloom.frame import numerical_frame
+        fields = ["x", "z"]
+        batches = list(self.app.store.batches("training", size=5))
+        accumulators = []
+        for batch in batches:
+            part = CovarianceAccumulator(numerical_frame(batch, fields).features)
+            part.update(numerical_frame(batch, fields))
+            accumulators.append(part)
+        merged = accumulators[-1]
+        for part in reversed(accumulators[:-1]):
+            merged.merge(part)
+        streamed = self.app.covariance_profile("ordered", "training", fields, size=5)
+        self.assertEqual(merged.result()["support"], streamed["support"])
+        for i in range(2):
+            for j in range(2):
+                self.assertAlmostEqual(merged.result()["covariance"][i][j],
+                                       streamed["covariance"][i][j], places=10)
+        # a batch with only zero-weight rows changes nothing
+        empty_weight = CovarianceAccumulator(merged.features)
+        frame = numerical_frame(batches[0], fields)
+        zeroed = frame.with_weights({key: 0.0 for key in frame.ids})
+        empty_weight.update(zeroed)
+        before = merged.digest()
+        merged.merge(empty_weight)
+        self.assertEqual(merged.digest(), before)

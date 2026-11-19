@@ -136,13 +136,20 @@ def drift(reference, current, fields):
 
 def collinearity(frame):
     frame.complete()
-    covariance = stats.covariance_matrix(frame)["covariance"]
-    if not frame.features or any(x is None for row in covariance for x in row):
+    profile = stats.covariance_matrix(frame)
+    return collinearity_profile(profile)
+
+
+def collinearity_profile(profile):
+    """Collinearity diagnostic on a covariance result, including a batch-merged one."""
+    covariance = profile["covariance"]
+    features = profile["features"]
+    if not features or any(x is None for row in covariance for x in row):
         raise NumericalError("collinearity requires observed support")
     try:
         inverse = la.inverse(covariance)
         condition = la.condition_indicator(covariance)
     except NumericalError:
-        return {"status": "SINGULAR", "features": list(frame.feature_ids()), "vif": None, "condition": None}
-    vif = {feature.id: covariance[i][i] * inverse[i][i] for i, feature in enumerate(frame.features)}
-    return {"status": "OK", "features": list(frame.feature_ids()), "vif": vif, "condition": condition}
+        return {"status": "SINGULAR", "features": list(features), "vif": None, "condition": None}
+    vif = {feature: covariance[i][i] * inverse[i][i] for i, feature in enumerate(features)}
+    return {"status": "OK", "features": list(features), "vif": vif, "condition": condition}

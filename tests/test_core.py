@@ -135,6 +135,136 @@ class MatrixTests(unittest.TestCase):
         self.assertAlmostEqual(stats.spearman([1, 2, 3], [3, 2, 1]), -1)
         self.assertEqual(stats.rank([3, 1, 1]), [3, 1.5, 1.5])
 
+    def test_covariance_accumulator_matches_full_pairwise_calculation(self):
+        import random
+        random.seed(11)
+        width, rows = 4, 48
+        features = [Feature(f"c{i}", f"c{i}") for i in range(width)]
+        offsets = (1e9, -1e9, 0.0, 42.0)
+        values, weights, ids = [], [], []
+        for r in range(rows):
+            row = [None if random.random() < .3 else offsets[c] + random.gauss(0, .4)
+                   for c in range(width)]
+            values.append(row)
+            weights.append(random.choice([0.0, .5, 1.0, 2.0]))
+            ids.append(f"r{r:02}")
+        full = Frame(ids, features, values, weights)
+        for ddof in (0, 1):
+            expected = stats.covariance_matrix(full, ddof=ddof, pairwise=True)
+            accumulator = stats.CovarianceAccumulator(features, ddof)
+            for start in range(0, rows, 5):
+                accumulator.update(Frame(ids[start:start + 5], features,
+                                         values[start:start + 5], weights[start:start + 5]))
+            streamed = accumulator.result()
+            self.assertEqual(streamed["support"], expected["support"])
+            self.assertEqual(streamed["population"], "pairwise")
+            for i in range(width):
+                for j in range(width):
+                    if expected["covariance"][i][j] is None:
+                        self.assertIsNone(streamed["covariance"][i][j])
+                    else:
+                        self.assertAlmostEqual(streamed["covariance"][i][j],
+                                               expected["covariance"][i][j], delta=1e-5)
+
+    def test_covariance_merge_is_order_independent(self):
+        features = [Feature("a", "a"), Feature("b", "b")]
+        first = Frame(["p", "q"], features, [[1.0, 10.0], [3.0, None]])
+        second = Frame(["r", "s"], features, [[5.0, 20.0], [7.0, 22.0]])
+        full = Frame(["p", "q", "r", "s"], features,
+                     [[1.0, 10.0], [3.0, None], [5.0, 20.0], [7.0, 22.0]])
+        expected = stats.covariance_matrix(full, pairwise=True)
+        left = stats.CovarianceAccumulator(features).update(first)
+        left.merge(stats.CovarianceAccumulator(features).update(second))
+        right = stats.CovarianceAccumulator(features).update(second)
+        right.merge(stats.CovarianceAccumulator(features).update(first))
+        self.assertEqual(left.result()["covariance"], right.result()["covariance"])
+        self.assertEqual(left.result()["support"], expected["support"])
+        for i in range(2):
+            for j in range(2):
+                self.assertAlmostEqual(left.result()["covariance"][i][j],
+                                       expected["covariance"][i][j], places=10)
+        # direct per-batch covariance averaging must disagree: missingness differs
+        c1 = stats.covariance_matrix(first, pairwise=True)["covariance"]
+        c2 = stats.covariance_matrix(second, pairwise=True)["covariance"]
+        self.assertNotAlmostEqual((c1[0][0] + c2[0][0]) / 2, expected["covariance"][0][0])
+
+    def test_covariance_state_roundtrip_and_validation(self):
+        features = [Feature("a", "a"), Feature("b", "b")]
+        accumulator = stats.CovarianceAccumulator(features, ddof=1, training_digest="digest-x")
+        accumulator.update(Frame(["p", "q", "r"], features,
+                                 [[1.0, 4.0], [2.0, None], [3.0, 8.0]], [1, 2, 1]))
+        restored = stats.CovarianceAccumulator.restore(accumulator.state())
+        self.assertEqual(restored.digest(), accumulator.digest())
+        self.assertEqual(restored.ddof, 1)
+        self.assertEqual(restored.training_digest, "digest-x")
+        self.assertEqual(restored.result()["covariance"], accumulator.result()["covariance"])
+        empty = stats.CovarianceAccumulator(features)
+        self.assertEqual(stats.CovarianceAccumulator.restore(empty.state()).result()["support"],
+                         [[0, 0], [0, 0]])
+        with self.assertRaises(SchemaError):
+            stats.CovarianceAccumulator(features, ddof=2)
+        with self.assertRaises(SchemaError):
+            accumulator.merge(stats.CovarianceAccumulator(features, ddof=0))
+        other_axis = [Feature("a", "a"), Feature("z", "z")]
+        with self.assertRaises(SchemaError):
+            accumulator.merge(stats.CovarianceAccumulator(other_axis))
+        with self.assertRaises(SchemaError):
+            accumulator.update(Frame(["p"], other_axis, [[1.0, 2.0]]))
+        with self.assertRaises(IdentityError):
+            stats.CovarianceAccumulator([Feature("a", "a"), Feature("a", "other")])
+
+    def test_covariance_edge_populations(self):
+        features = [Feature("a", "a"), Feature("b", "b")]
+        # empty batch followed by real observations
+        accumulator = stats.CovarianceAccumulator(features)
+        accumulator.update(Frame([], features, []))
+        accumulator.update(Frame(["p"], features, [[1.0, 2.0]]))
+        self.assertEqual(accumulator.result()["support"], [[1, 1], [1, 1]])
+        self.assertEqual(accumulator.result()["covariance"], [[0.0, 0.0], [0.0, 0.0]])
+        # single paired point under ddof=1 is undefined, not zero
+        single = stats.CovarianceAccumulator(features, ddof=1).update(
+            Frame(["p"], features, [[1.0, 2.0]]))
+        self.assertTrue(all(x is None for row in single.result()["covariance"] for x in row))
+        # zero-weight rows contribute nothing and are not counted as support
+        zero = stats.CovarianceAccumulator(features).update(
+            Frame(["p"], features, [[1.0, 2.0]], [0.0]))
+        self.assertEqual(zero.result()["support"], [[0, 0], [0, 0]])
+        self.assertTrue(all(x is None for row in zero.result()["covariance"] for x in row))
+        # missing entries are pairwise deleted, never treated as zero
+        missing = stats.CovarianceAccumulator(features).update(
+            Frame(["p", "q"], features, [[1.0, None], [3.0, 4.0]]))
+        self.assertEqual(missing.result()["support"], [[2, 1], [1, 1]])
+        self.assertEqual(missing.result()["covariance"][0][0], 1.0)
+        self.assertEqual(missing.pair("b", "a").observed, 1)
+        # large offset with small variation retains precision instead of collapsing
+        big = Frame([f"r{i}" for i in range(3)], [Feature("v", "v")],
+                    [[1e12 + 1.0], [1e12 + 2.0], [1e12 + 3.0]])
+        variance = stats.covariance_matrix(big)["covariance"][0][0]
+        self.assertAlmostEqual(variance, 2 / 3, delta=1e-7)
+        # weighted ddof=1 stays on the same reliability-weight denominator as covariance()
+        weighted = Frame(["p", "q", "r", "s"], features,
+                         [[1.0, 2.0], [2.0, None], [3.0, 6.0], [4.0, 8.0]], [1, 2, .5, 1])
+        profile = stats.CovarianceAccumulator(features, 1).update(weighted).result()
+        self.assertAlmostEqual(profile["covariance"][0][1],
+                               stats.covariance([1, 2, 3, 4], [2, None, 6, 8],
+                                                [1, 2, .5, 1], ddof=1))
+        with self.assertRaises(IdentityError):
+            stats.CovarianceAccumulator(features).pair("a", "missing")
+
+    def test_complete_row_covariance_uses_shared_population(self):
+        features = [Feature("a", "a"), Feature("b", "b")]
+        data = Frame(["p", "q", "r"], features,
+                     [[1.0, 10.0], [3.0, None], [5.0, 20.0]])
+        profile = stats.covariance_matrix(data, pairwise=False)
+        self.assertEqual(profile["population"], "complete_rows")
+        self.assertEqual(profile["support"], [[2, 2], [2, 2]])
+        accumulator = stats.CovarianceAccumulator(features)
+        complete = data.take(key for key, row in zip(data.ids, data.values)
+                             if all(x is not None for x in row))
+        accumulator.update(complete)
+        self.assertEqual(accumulator.result("complete_rows")["covariance"],
+                         profile["covariance"])
+
 
 class FeatureTests(unittest.TestCase):
     def test_encoder_preserves_frozen_identity(self):

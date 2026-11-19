@@ -33,6 +33,8 @@ Ridge minimizes weighted squared residuals plus `alpha * sum(beta**2)`, with an 
 
 Weighted variance with `ddof=1` uses the reliability-weight denominator `sum(w) - sum(w**2)/sum(w)`. Quantiles use the smallest value whose cumulative positive weight reaches the requested fraction. Pairwise covariance reports pair-specific support and may be non-positive-semidefinite when observation patterns differ; it must not be treated automatically as a complete-data covariance matrix.
 
+Covariance can be accumulated batch by batch. `CovarianceAccumulator` keeps independent weighted Welford moments for every feature pair over the samples where both features are observed with positive weight: each pair owns its center, total weight, squared weight, co-moment, and support. Batches with different missing positions combine through the parallel moment formula, so merging accumulators in any order reproduces the same-population full calculation up to floating-point ordering; averaging per-batch covariance matrices does not. Missing entries are pairwise deleted and never zero-filled, and no column-wide mean is shared across pairs. Empty batches and zero-weight rows change nothing, a single paired observation yields zero covariance under `ddof=0` but is undefined under `ddof=1`, and the online centers keep large-offset/small-variation data numerically stable. Accumulator states serialize, restore, and digest like other fitted states. The SQLite layer stores only the O(k²) pair moments in their own revisioned table—never the source rows—and the merged covariance profile feeds the existing collinearity diagnostic.
+
 ## Application flow
 
 ```python
@@ -56,7 +58,7 @@ Random, stratified, temporal, and k-fold split constructors are available. `hold
 
 ## Persistence
 
-`Store` retains immutable dataset and model revisions. A dataset revision freezes schema, order, sample identities, values, weights, and digest. Model bundles bind the fitted preprocessing state and estimator state; optional dataset binding verifies the training digest. Evaluation ids are idempotent only for the same model, dataset revision, population, predictions, and metrics.
+`Store` retains immutable dataset and model revisions. A dataset revision freezes schema, order, sample identities, values, weights, and digest. Model bundles bind the fitted preprocessing state and estimator state; optional dataset binding verifies the training digest. Covariance states are revisioned separately and bind the dataset digest they were accumulated from, storing pair moments rather than rows. Evaluation ids are idempotent only for the same model, dataset revision, population, predictions, and metrics.
 
 Version 1 stores sample rows as JSON arrays in SQLite and exports model bundles as a versioned JSON envelope. Bundle import validates its digest and reconstructs supported numerical states; it does not execute pickles or arbitrary code. Full table loading verifies its digest. Batched and selected-row reads validate structure and population but do not independently recompute the full dataset digest.
 

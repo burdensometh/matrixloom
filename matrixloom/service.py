@@ -1,13 +1,14 @@
 from pathlib import Path
 
-from .diagnostics import associations, collinearity, drift, missing_by_group, outliers
+from .diagnostics import (associations, collinearity, collinearity_profile, drift,
+                          missing_by_group, outliers)
 from .errors import SchemaError
 from .evaluation import holdout, score, learning_curve, permutation_importance, targets
 from .frame import numerical_frame
 from .metrics import compare, silhouette
 from .pipeline import Features, Predictor, Clusterer
 from .splits import random_split
-from .statistics import summarize, covariance_matrix, frequency
+from .statistics import CovarianceAccumulator, summarize, covariance_matrix, frequency
 from .storage import Store
 from .table import Table
 from .units import normalize
@@ -156,6 +157,38 @@ class Analysis:
     def collinearity(self, dataset_name, feature_spec, dataset_revision=None):
         prepared = self.encoded(dataset_name, feature_spec, dataset_revision)
         return collinearity(prepared["frame"])
+
+    def covariance_profile(self, name, dataset_name, fields, ddof=0, pairwise=True,
+                           size=256, dataset_revision=None, save=None):
+        """Accumulate covariance over database batches without retaining raw rows.
+
+        Each batch is converted to a numeric frame, folded into a pair-wise
+        accumulator, and released. When ``save`` is set the merged moments are
+        persisted as their own revisioned state, never the source rows.
+        """
+        info = self.store.table_info(dataset_name, dataset_revision)
+        first = True
+        accumulator = None
+        for batch in self.store.batches(dataset_name, info["revision"], size):
+            frame = numerical_frame(batch, fields)
+            if first:
+                accumulator = CovarianceAccumulator(frame.features, ddof, info["digest"])
+                first = False
+            accumulator.update(frame)
+        if accumulator is None:
+            raise SchemaError("covariance profile requires a nonempty dataset")
+        profile = accumulator.result("pairwise" if pairwise else "complete_rows")
+        result = {"dataset": [dataset_name, info["revision"]], "dataset_digest": info["digest"],
+                  "batch_size": size, **profile}
+        if save is not None:
+            result["saved"] = self.store.save_covariance(save, accumulator,
+                                                         (dataset_name, info["revision"]))
+        return result
+
+    def collinearity_profile(self, state_name, state_revision=None):
+        """Run the existing collinearity diagnostic on a saved merged covariance state."""
+        accumulator = self.store.load_covariance(state_name, state_revision)
+        return collinearity_profile(accumulator.result("pairwise"))
 
     def prediction_batches(self, model_name, dataset_name, size=256,
                            model_revision=None, dataset_revision=None):

@@ -6,6 +6,7 @@ import sqlite3
 
 from .errors import IdentityError, StateError
 from .schema import Schema, canonical, fingerprint
+from .statistics import CovarianceAccumulator
 from .table import Sample, Table
 from .pipeline import restore_bundle
 
@@ -57,6 +58,17 @@ CREATE TABLE IF NOT EXISTS evaluations (
   FOREIGN KEY(bundle_name,bundle_revision) REFERENCES bundles(name,revision),
   FOREIGN KEY(dataset_name,dataset_revision) REFERENCES datasets(name,revision)
 );
+CREATE TABLE IF NOT EXISTS covariance_states (
+  name TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  dataset_name TEXT,
+  dataset_revision INTEGER,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(name,revision),
+  FOREIGN KEY(dataset_name,dataset_revision) REFERENCES datasets(name,revision)
+);
 """
 
 
@@ -102,7 +114,7 @@ class Store:
             connection.close()
 
     def _latest(self, connection, table, key):
-        if table not in {"datasets", "bundles"}:
+        if table not in {"datasets", "bundles", "covariance_states"}:
             raise StateError("invalid revision namespace")
         row = connection.execute(f"SELECT max(revision) AS revision FROM {table} WHERE name=?", (key,)).fetchone()
         return row["revision"] or 0
@@ -285,8 +297,60 @@ class Store:
             raise StateError("bundle envelope checksum mismatch")
         return self.save_bundle(key, restore_bundle(envelope["payload"]), expected_revision=expected_revision)
 
+    def save_covariance(self, key, accumulator, dataset=None, expected_revision=None):
+        name(key)
+        if not isinstance(accumulator, CovarianceAccumulator):
+            raise StateError("covariance persistence requires a CovarianceAccumulator")
+        state = accumulator.state()
+        payload = canonical(state)
+        digest = fingerprint(state)
+        dataset_name, dataset_revision = (None, None) if dataset is None else dataset
+        with self.transaction() as connection:
+            if dataset_name is not None:
+                info = self._dataset(connection, dataset_name, dataset_revision)
+                if accumulator.training_digest != info["digest"]:
+                    raise StateError("covariance state differs from bound dataset revision")
+                dataset_revision = info["revision"]
+            revision = self._revision(connection, "covariance_states", key, expected_revision)
+            connection.execute("INSERT INTO covariance_states VALUES(?,?,?,?,?,?,?)",
+                               (key, revision, payload, digest, dataset_name, dataset_revision, now()))
+        return {"name": key, "revision": revision, "digest": digest,
+                "features": state["features"], "pairs": len(state["pairs"]), "ddof": state["ddof"]}
+
+    def _covariance(self, connection, key, revision):
+        name(key)
+        if revision is None:
+            revision = self._latest(connection, "covariance_states", key)
+        row = connection.execute("SELECT * FROM covariance_states WHERE name=? AND revision=?",
+                                 (key, revision)).fetchone()
+        if row is None:
+            raise IdentityError("covariance state revision does not exist")
+        state = json.loads(row["payload"])
+        if fingerprint(state) != row["digest"]:
+            raise StateError("stored covariance integrity check failed")
+        return row, state
+
+    def load_covariance(self, key, revision=None):
+        connection = self.connect()
+        try:
+            _, state = self._covariance(connection, key, revision)
+            return CovarianceAccumulator.restore(state)
+        finally:
+            connection.close()
+
+    def covariance_info(self, key, revision=None):
+        connection = self.connect()
+        try:
+            row, state = self._covariance(connection, key, revision)
+            return {"name": row["name"], "revision": row["revision"], "digest": row["digest"],
+                    "dataset_name": row["dataset_name"], "dataset_revision": row["dataset_revision"],
+                    "features": [feature["id"] for feature in state["features"]],
+                    "ddof": state["ddof"], "created_at": row["created_at"]}
+        finally:
+            connection.close()
+
     def revisions(self, key, kind="dataset"):
-        table = {"dataset": "datasets", "bundle": "bundles"}.get(kind)
+        table = {"dataset": "datasets", "bundle": "bundles", "covariance": "covariance_states"}.get(kind)
         if table is None:
             raise StateError("invalid revision kind")
         connection = self.connect()

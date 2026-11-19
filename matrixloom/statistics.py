@@ -1,7 +1,8 @@
 import math
 
-from .errors import NumericalError, SchemaError
-from .schema import finite
+from .errors import IdentityError, NumericalError, SchemaError, StateError
+from .frame import Feature, Frame
+from .schema import finite, fingerprint
 
 
 def observed(values, weights=None):
@@ -97,6 +98,212 @@ def covariance(left, right, weights=None, ddof=0):
     return math.fsum(w * (a - a_mean) * (b - b_mean) for a, b, w in pairs) / denominator
 
 
+class _PairMoments:
+    """Weighted Welford moments for one feature pair over its own jointly observed samples.
+
+    Missing entries never reach this class: the caller only feeds rows where both
+    features are observed and the sample carries positive weight. Each pair therefore
+    keeps its own center and support; no column-wide mean is ever shared across pairs.
+    """
+
+    __slots__ = ("weight", "mean_a", "mean_b", "comoment", "squared_weight", "observed")
+
+    def __init__(self):
+        self.weight = 0.0
+        self.mean_a = 0.0
+        self.mean_b = 0.0
+        self.comoment = 0.0
+        self.squared_weight = 0.0
+        self.observed = 0
+
+    def observe(self, a, b, weight):
+        self.observed += 1
+        self.squared_weight += weight * weight
+        new_weight = self.weight + weight
+        delta_a = a - self.mean_a
+        delta_b = b - self.mean_b
+        self.mean_a += delta_a * (weight / new_weight)
+        self.mean_b += delta_b * (weight / new_weight)
+        self.comoment += weight * delta_a * (b - self.mean_b)
+        self.weight = new_weight
+
+    @classmethod
+    def combine(cls, left, right):
+        result = cls()
+        if left.weight <= 0.0:
+            return cls._copy(right)
+        if right.weight <= 0.0:
+            return cls._copy(left)
+        total = left.weight + right.weight
+        gap_a = right.mean_a - left.mean_a
+        gap_b = right.mean_b - left.mean_b
+        result.weight = total
+        result.mean_a = left.mean_a + gap_a * (right.weight / total)
+        result.mean_b = left.mean_b + gap_b * (right.weight / total)
+        result.comoment = (left.comoment + right.comoment
+                           + gap_a * gap_b * (left.weight * right.weight / total))
+        result.squared_weight = left.squared_weight + right.squared_weight
+        result.observed = left.observed + right.observed
+        return result
+
+    @classmethod
+    def _copy(cls, other):
+        result = cls()
+        result.weight = other.weight
+        result.mean_a = other.mean_a
+        result.mean_b = other.mean_b
+        result.comoment = other.comoment
+        result.squared_weight = other.squared_weight
+        result.observed = other.observed
+        return result
+
+    def denominator(self, ddof):
+        scale = self.squared_weight / self.weight if ddof == 1 else 0.0
+        return self.weight - scale
+
+    def covariance(self, ddof):
+        if self.weight <= 0.0:
+            return None
+        denominator = self.denominator(ddof)
+        if denominator <= 0.0:
+            return None
+        return self.comoment / denominator
+
+    def state(self):
+        return {"weight": self.weight, "mean_a": self.mean_a, "mean_b": self.mean_b,
+                "comoment": self.comoment, "squared_weight": self.squared_weight,
+                "observed": self.observed}
+
+    @classmethod
+    def restore(cls, state):
+        result = cls()
+        result.weight = float(state["weight"])
+        result.mean_a = float(state["mean_a"])
+        result.mean_b = float(state["mean_b"])
+        result.comoment = float(state["comoment"])
+        result.squared_weight = float(state["squared_weight"])
+        result.observed = int(state["observed"])
+        return result
+
+
+class CovarianceAccumulator:
+    """Batch-wise weighted covariance with pair-specific pairwise-deletion support.
+
+    Every feature pair maintains independent moments over the samples where both
+    features are observed with positive weight, so batches with different missing
+    patterns combine exactly as if all observations were processed together.
+    Merging is order independent; no original rows are retained.
+    """
+
+    def __init__(self, features, ddof=0, training_digest=None):
+        features = tuple(features)
+        if not features or any(not isinstance(feature, Feature) for feature in features):
+            raise SchemaError("covariance accumulator requires feature lineage")
+        if len({feature.id for feature in features}) != len(features):
+            raise IdentityError("duplicate feature identity")
+        if ddof not in (0, 1):
+            raise SchemaError("ddof must be 0 or 1")
+        self.features = features
+        self.ddof = ddof
+        self.training_digest = training_digest
+        size = len(features)
+        self._moments = [[_PairMoments() if j >= i else None for j in range(size)]
+                         for i in range(size)]
+
+    @property
+    def width(self):
+        return len(self.features)
+
+    def _check_axis(self, frame):
+        if frame.features != self.features:
+            raise SchemaError("covariance batch feature axis differs from the accumulator")
+
+    def update(self, frame):
+        if not isinstance(frame, Frame):
+            raise SchemaError("covariance updates require a Frame")
+        self._check_axis(frame)
+        width = self.width
+        for row, weight in zip(frame.values, frame.weights):
+            if weight <= 0:
+                continue
+            observed = [i for i in range(width) if row[i] is not None]
+            for position, i in enumerate(observed):
+                for j in observed[position:]:
+                    self._moments[i][j].observe(row[i], row[j], weight)
+        return self
+
+    def merge(self, other):
+        if not isinstance(other, CovarianceAccumulator):
+            raise SchemaError("can only merge covariance accumulators")
+        if other.features != self.features:
+            raise SchemaError("covariance merge feature axes differ")
+        if other.ddof != self.ddof:
+            raise SchemaError("covariance merge requires matching ddof")
+        for i in range(self.width):
+            for j in range(i, self.width):
+                self._moments[i][j] = _PairMoments.combine(self._moments[i][j], other._moments[i][j])
+        return self
+
+    def pair(self, left_id, right_id):
+        indexes = {feature.id: i for i, feature in enumerate(self.features)}
+        if left_id not in indexes or right_id not in indexes:
+            raise IdentityError("unknown covariance feature")
+        i, j = indexes[left_id], indexes[right_id]
+        if i > j:
+            i, j = j, i
+        return self._moments[i][j]
+
+    def result(self, population="pairwise"):
+        if population not in {"pairwise", "complete_rows"}:
+            raise SchemaError("covariance population must be pairwise or complete_rows")
+        covariance, support, effective_support, weights = [], [], [], []
+        for i in range(self.width):
+            row_values, row_support, row_effective, row_weights = [], [], [], []
+            for j in range(self.width):
+                moments = self._moments[min(i, j)][max(i, j)]
+                row_values.append(moments.covariance(self.ddof))
+                row_support.append(moments.observed)
+                row_weights.append(moments.weight if moments.weight > 0 else None)
+                if moments.weight > 0:
+                    denominator = moments.denominator(self.ddof)
+                    row_effective.append(moments.weight * moments.weight / moments.squared_weight
+                                         if denominator > 0 else None)
+                else:
+                    row_effective.append(None)
+            covariance.append(row_values)
+            support.append(row_support)
+            effective_support.append(row_effective)
+            weights.append(row_weights)
+        return {"features": [feature.id for feature in self.features], "covariance": covariance,
+                "support": support, "effective_support": effective_support, "pair_weight": weights,
+                "population": population, "ddof": self.ddof}
+
+    def state(self):
+        pairs = []
+        for i in range(self.width):
+            for j in range(i, self.width):
+                pairs.append({"left": i, "right": j, **self._moments[i][j].state()})
+        return {"version": 1, "kind": "covariance_accumulator", "ddof": self.ddof,
+                "training_digest": self.training_digest,
+                "features": [feature.state() for feature in self.features], "pairs": pairs}
+
+    def digest(self):
+        return fingerprint(self.state())
+
+    @classmethod
+    def restore(cls, state):
+        if state.get("version") != 1 or state.get("kind") != "covariance_accumulator":
+            raise StateError("unsupported covariance accumulator state")
+        result = cls([Feature(**feature) for feature in state["features"]], state["ddof"],
+                     state.get("training_digest"))
+        for entry in state["pairs"]:
+            i, j = entry["left"], entry["right"]
+            if not (0 <= i <= j < result.width):
+                raise StateError("covariance pair index outside feature axis")
+            result._moments[i][j] = _PairMoments.restore(entry)
+        return result
+
+
 def correlation(left, right, weights=None):
     weights = (1.0,) * len(left) if weights is None else tuple(weights)
     if len(left) != len(right) or len(left) != len(weights):
@@ -134,23 +341,8 @@ def summarize(frame):
 def covariance_matrix(frame, ddof=0, pairwise=False):
     if not pairwise:
         frame = frame.take(key for key, row in zip(frame.ids, frame.values) if all(x is not None for x in row))
-    columns = [frame.column(f.id) for f in frame.features]
-    result = []
-    supports = []
-    for left in columns:
-        values = []
-        counts = []
-        for right in columns:
-            try:
-                values.append(covariance(left, right, frame.weights, ddof))
-            except NumericalError:
-                values.append(None)
-            counts.append(sum(a is not None and b is not None and w > 0
-                              for a, b, w in zip(left, right, frame.weights)))
-        result.append(values)
-        supports.append(counts)
-    return {"features": list(frame.feature_ids()), "covariance": result,
-            "support": supports, "population": "pairwise" if pairwise else "complete_rows", "ddof": ddof}
+    accumulator = CovarianceAccumulator(frame.features, ddof).update(frame)
+    return accumulator.result("pairwise" if pairwise else "complete_rows")
 
 
 def frequency(values, weights=None):
