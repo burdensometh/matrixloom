@@ -128,6 +128,26 @@ class WorkflowTests(unittest.TestCase):
         clusterer = self.app.store.load_bundle("clusters")
         self.assertEqual(Clusterer.restore(clusterer.state()).predict(self.table), result["assignments"])
 
+    def test_clustering_reports_unassignable_population_after_reopen(self):
+        partial = self.table.replace_column("z", [None if i % 2 == 0 else float(i % 3) for i in range(len(self.table))])
+        partial = partial.append(Table(partial.schema, [Sample("blank", (None, None, "a", "north",
+                                                                      "2020-01-20T00:00:00Z", 1.0, 0))]))
+        self.app.ingest("partial", partial)
+        spec = {"fields": ["x", "z"], "transforms": [{"kind": "standardize"}]}
+        result = self.app.cluster("partial-clusters", "partial", spec, {"kind": "kmeans", "clusters": 2})
+        self.assertEqual(result["support_mode"], "partial")
+        self.assertEqual(result["unassignable_ids"], ["blank"])
+        self.assertFalse(result["assignments"]["blank"]["assignable"])
+        self.assertIsNone(result["assignments"]["blank"]["cluster"])
+        assigned = {key: value["support"] for key, value in result["assignments"].items() if key != "blank"}
+        self.assertEqual(set(assigned.values()), {1, 2})
+        reopened = Analysis(self.app.home)
+        self.assertEqual(reopened.predict("partial-clusters", "partial"), result["assignments"])
+        quality = reopened.cluster_quality("partial-clusters", "partial")
+        self.assertEqual(quality["unassignable_ids"], ["blank"])
+        self.assertEqual(quality["assignable"], len(self.table))
+        self.assertEqual(quality["support"], "available_case")
+
     def test_classifier_uses_probabilities_and_population_weights(self):
         spec = {"fields": ["x"], "transforms": [{"kind": "standardize"}]}
         self.app.train("binary", "training", spec, {"kind": "logistic"}, "label")

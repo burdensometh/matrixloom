@@ -116,30 +116,69 @@ def roc_auc(truth, probabilities, weights=None):
 
 
 def silhouette(frame, labels):
-    from .linalg import squared_distance
-    frame.complete()
+    """Mean silhouette over assignable samples with available-case scaling.
+
+    ``labels`` may carry ``None`` for unassignable samples (for example fully
+    unobserved rows); those samples are excluded from the population instead
+    of being treated as an ordinary cluster.  Pairwise distances use the same
+    observed-dimension scaling as the clustering objective, and pairs that
+    share no observed dimension are excluded from that sample's comparison.
+    """
     if set(labels) != set(frame.ids):
         raise IdentityError("clustering labels do not match population")
+    populated = [key for key in frame.ids if labels[key] is not None]
+    unassignable = [key for key in frame.ids if labels[key] is None]
+    indexes = {key: i for i, key in enumerate(frame.ids)}
     groups = {}
-    for i, key in enumerate(frame.ids):
-        groups.setdefault(labels[key], []).append(i)
-    if len(groups) < 2 or len(groups) == len(frame):
+    for key in populated:
+        groups.setdefault(labels[key], []).append(key)
+    if len(groups) < 2 or len(groups) == len(populated):
         raise NumericalError("silhouette requires 2..n-1 populated clusters")
+    width = frame.width
     scores = []
-    for i, key in enumerate(frame.ids):
-        own = [j for j in groups[labels[key]] if j != i]
+    scored = []
+    for key in populated:
+        i = indexes[key]
+        own = [frame.values[indexes[peer]] for peer in groups[labels[key]] if peer != key]
         if not own:
             scores.append(0.0)
+            scored.append(key)
             continue
-        a = math.fsum(math.sqrt(squared_distance(frame.values[i], frame.values[j])) for j in own) / len(own)
+        a = _mean_observed_distance(frame.values[i], own, width)
         other_distances = []
-        for group, indexes in groups.items():
+        for group, members in groups.items():
             if group != labels[key]:
-                other_distances.append(math.fsum(math.sqrt(squared_distance(frame.values[i], frame.values[j]))
-                                                 for j in indexes) / len(indexes))
+                value = _mean_observed_distance(frame.values[i],
+                                                [frame.values[indexes[peer]] for peer in members], width)
+                if value is not None:
+                    other_distances.append(value)
+        if a is None or not other_distances:
+            continue
         b = min(other_distances)
         scores.append((b - a) / max(a, b) if max(a, b) > 0 else 0.0)
-    return {"mean": mean(scores), "by_sample": dict(zip(frame.ids, scores)), "weighted": False}
+        scored.append(key)
+    if not scores:
+        raise NumericalError("silhouette has no comparable observed population")
+    return {"mean": mean(scores), "by_sample": dict(zip(scored, scores)), "weighted": False,
+            "assignable": len(populated), "unassignable": len(unassignable),
+            "unassignable_ids": unassignable,
+            "support": "available_case" if any(value is None for row in frame.values for value in row)
+                       else "complete"}
+
+
+def _mean_observed_distance(left, others, width):
+    distances = []
+    for right in others:
+        total = 0.0
+        observed = 0
+        for a, b in zip(left, right):
+            if a is None or b is None:
+                continue
+            observed += 1
+            total += (a - b) ** 2
+        if observed:
+            distances.append(math.sqrt(total if observed == width else total * width / observed))
+    return math.fsum(distances) / len(distances) if distances else None
 
 
 def threshold_curve(truth, probabilities, weights=None):

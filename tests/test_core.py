@@ -216,6 +216,42 @@ class EstimatorTests(unittest.TestCase):
         self.assertGreater(metrics.silhouette(f, labels)["mean"], .8)
         self.assertEqual(restore_model(model.state()).predict(f), model.predict(f))
 
+    def test_kmeans_partial_support_objective_and_failures(self):
+        # Scaling: one observed of two dimensions doubles the squared distance.
+        self.assertEqual(KMeans._objective((0.0, None), (2.0, 5.0)), 8)
+        self.assertEqual(KMeans._objective((0.0, 3.0), (2.0, 5.0)), 8)
+        self.assertIsNone(KMeans._objective((None, None), (2.0, 5.0)))
+        # Centers are weighted means of observed coordinates only, never imputed.
+        f = frame([[0, None], [0, 0], [10, 10], [10, None]])
+        model = KMeans(2).fit(f)
+        self.assertEqual(model.mode, "partial")
+        self.assertEqual(sorted(model.centers), [(0.0, 0.0), (10.0, 10.0)])
+        assignments = model.predict(f)
+        by_label = {key: value["cluster"] for key, value in assignments.items()}
+        self.assertEqual(by_label["s0"], by_label["s1"])
+        self.assertEqual(by_label["s2"], by_label["s3"])
+        self.assertNotEqual(by_label["s0"], by_label["s2"])
+        self.assertEqual(assignments["s0"]["support"], 1)
+        self.assertEqual(assignments["s0"]["squared_distance"], 0)
+        self.assertEqual(restore_model(model.state()).predict(f), assignments)
+        # Fully unobserved samples are unassignable, not filled with a mean.
+        with_missing = frame([[0, 0], [0.1, 0], [9, 9], [9.1, 9], [None, None]])
+        partial = KMeans(2).fit(with_missing)
+        result = partial.predict(with_missing)
+        self.assertFalse(result["s4"]["assignable"])
+        self.assertIsNone(result["s4"]["cluster"])
+        self.assertEqual(result["s4"]["support"], 0)
+        labels = {key: value["cluster"] for key, value in result.items()}
+        quality = metrics.silhouette(with_missing, labels)
+        self.assertEqual(quality["unassignable_ids"], ["s4"])
+        self.assertEqual(quality["assignable"], 4)
+        self.assertNotIn("s4", quality["by_sample"])
+        # Empty clusters and unsupported centers fail explicitly.
+        with self.assertRaisesRegex(NumericalError, "empty cluster"):
+            KMeans(2).fit(frame([[0, 0], [0, None], [None, 0], [None, None]]))
+        with self.assertRaisesRegex(NumericalError, "no observed support"):
+            KMeans(2).fit(frame([[0, None], [0, None], [9, 9], [9, 9]]))
+
     def test_logistic_against_symmetry_and_replication(self):
         f = frame([[-2], [-1], [1], [2]])
         y = dict(zip(f.ids, [0, 0, 1, 1]))

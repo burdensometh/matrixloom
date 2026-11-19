@@ -180,6 +180,18 @@ class Neighbors(Regressor):
 
 
 class KMeans:
+    """Lloyd-style clustering with available-case support weighting.
+
+    A sample with some unobserved feature dimensions is assigned with the
+    objective ``p / p_i * sum_{observed j} (x_ij - c_kj) ** 2``, where ``p``
+    is the total feature width and ``p_i`` the sample's observed width.
+    Centers minimize exactly that weighted objective: each coordinate is the
+    weighted mean of its observed values using effective weight ``w_i / p_i``.
+    Fully unobserved samples are unassignable; clusters or coordinates without
+    observed support fail instead of inventing a center value.  The previously
+    supported complete-observation path is unchanged.
+    """
+
     kind = "kmeans"
 
     def __init__(self, clusters=2, max_iterations=100, tolerance=1e-8, seed=0):
@@ -197,18 +209,55 @@ class KMeans:
         self.centers = None
         self.inertia = None
         self.iterations = None
+        self.mode = None
+
+    @staticmethod
+    def _support(row):
+        return sum(value is not None for value in row)
+
+    @staticmethod
+    def _distance(row, center):
+        """(raw squared distance, observed dimension count); None if unsupported."""
+        total = 0.0
+        observed = 0
+        for value, reference in zip(row, center):
+            if value is None or reference is None:
+                continue
+            observed += 1
+            difference = value - reference
+            total += difference * difference
+        if observed == 0:
+            return None
+        return total, observed
+
+    @classmethod
+    def _objective(cls, row, center):
+        """Scaled squared distance ``p / p_i * sum_observed``; None if unsupported."""
+        measured = cls._distance(row, center)
+        if measured is None:
+            return None
+        total, observed = measured
+        width = len(row)
+        return total if observed == width else total * width / observed
 
     def _assign(self, values, centers):
         labels = []
-        distances = []
+        objectives = []
         for row in values:
-            options = [la.squared_distance(row, center) for center in centers]
+            options = [self._objective(row, center) for center in centers]
+            options = [math.inf if value is None else value for value in options]
             label = min(range(len(options)), key=lambda i: (options[i], i))
             labels.append(label)
-            distances.append(options[label])
-        return labels, distances
+            objectives.append(options[label])
+        return labels, objectives
 
     def fit(self, frame):
+        positive = [row for row, weight in zip(frame.values, frame.weights) if weight > 0]
+        if all(value is not None for row in positive for value in row):
+            return self._fit_complete(frame)
+        return self._fit_partial(frame)
+
+    def _fit_complete(self, frame):
         frame = frame.complete().positive_population()
         if frame.width == 0 or len(frame) < self.clusters:
             raise SchemaError("insufficient positive samples or features for clustering")
@@ -245,27 +294,127 @@ class KMeans:
         self.centers = tuple(centers)
         self.inertia = math.fsum(w * d for w, d in zip(frame.weights, distances))
         self.iterations = iteration
+        self.mode = "complete"
+        return self
+
+    def _fit_partial(self, frame):
+        width = frame.width
+        if width == 0:
+            raise SchemaError("insufficient positive samples or features for clustering")
+        entries = []
+        for key, row, weight in zip(frame.ids, frame.values, frame.weights):
+            support = self._support(row)
+            if weight > 0 and support > 0:
+                entries.append((key, row, weight, support))
+        if len(entries) < self.clusters:
+            raise SchemaError("insufficient observed positive samples for clustering")
+        for j, feature in enumerate(frame.features):
+            observed = [(row[j], weight) for _, row, weight, _ in entries if row[j] is not None]
+            if not observed:
+                raise NumericalError(f"feature {feature.id} has no observed support for clustering")
+        unique = {}
+        for key, row, _, _ in entries:
+            unique.setdefault(row, key)
+        if len(unique) < self.clusters:
+            raise NumericalError("not enough distinct observed points for requested clusters")
+
+        # Initialization may complete a seed's unobserved coordinates from the
+        # observed column mean.  This only places starting centers; every
+        # subsequent assignment and update uses solely observed values.
+        column_means = [mean([row[j] for _, row, _, _ in entries if row[j] is not None],
+                             [weight for _, row, weight, _ in entries if row[j] is not None])
+                        for j in range(width)]
+        complete_rows = [row for row in unique if all(value is not None for value in row)]
+        pool = sorted(complete_rows if len(complete_rows) >= self.clusters else unique,
+                      key=lambda row: unique[row])
+        seeds = []
+        first = random.Random(self.seed).randrange(len(pool))
+        seeds.append(pool.pop(first))
+        while len(seeds) < self.clusters:
+            distances = []
+            for row in pool:
+                options = []
+                for seed in seeds:
+                    value = self._objective(row, tuple(
+                        column_means[j] if seed[j] is None else seed[j] for j in range(width)))
+                    if value is not None:
+                        options.append(value)
+                distances.append(min(options) if options else math.inf)
+            position = max(range(len(pool)), key=lambda i: (distances[i], unique[pool[i]]))
+            seeds.append(pool.pop(position))
+        centers = [tuple(column_means[j] if row[j] is None else row[j] for j in range(width))
+                   for row in seeds]
+
+        values = [row for _, row, _, _ in entries]
+        weights = [weight for _, _, weight, _ in entries]
+        supports = [support for _, _, _, support in entries]
+        for iteration in range(1, self.max_iterations + 1):
+            labels, _ = self._assign(values, centers)
+            updated = []
+            for cluster in range(self.clusters):
+                members = [i for i, label in enumerate(labels) if label == cluster]
+                if not members:
+                    raise NumericalError("clustering produced an empty cluster")
+                center = []
+                for j in range(width):
+                    observed = [i for i in members if values[i][j] is not None]
+                    if not observed:
+                        raise NumericalError(
+                            f"cluster {cluster} has no observed support for feature {frame.features[j].id}")
+                    effective = [weights[i] / supports[i] for i in observed]
+                    center.append(mean([values[i][j] for i in observed], effective))
+                updated.append(tuple(center))
+            movement = max(la.squared_distance(a, b) for a, b in zip(centers, updated))
+            centers = updated
+            if movement <= self.tolerance * self.tolerance:
+                break
+        labels, objectives = self._assign(values, centers)
+        if len(set(labels)) != self.clusters:
+            raise NumericalError("final clustering has an empty cluster")
+        self.features = frame.features
+        self.centers = tuple(centers)
+        self.inertia = math.fsum(weight * objective for weight, objective in zip(weights, objectives))
+        self.iterations = iteration
+        self.mode = "partial"
         return self
 
     def predict(self, frame):
         if self.features is None:
             raise NotFitted("clustering model has not been fitted")
-        frame = frame.align_features(self.features).complete()
-        labels, distances = self._assign(frame.values, self.centers)
-        return {key: {"cluster": label, "squared_distance": distance}
-                for key, label, distance in zip(frame.ids, labels, distances)}
+        frame = frame.align_features(self.features)
+        if self.mode == "complete":
+            frame = frame.complete()
+            labels, objectives = self._assign(frame.values, self.centers)
+            return {key: {"cluster": label, "squared_distance": objective}
+                    for key, label, objective in zip(frame.ids, labels, objectives)}
+        labels, objectives = self._assign(frame.values, self.centers)
+        result = {}
+        for key, row, label, objective in zip(frame.ids, frame.values, labels, objectives):
+            measured = self._distance(row, self.centers[label])
+            if measured is None:
+                result[key] = {"cluster": None, "squared_distance": None, "objective": None,
+                               "support": 0, "assignable": False}
+            else:
+                raw, observed = measured
+                result[key] = {"cluster": label, "squared_distance": raw, "objective": objective,
+                               "support": observed, "assignable": True}
+        return result
 
     def state(self):
         if self.features is None:
             raise NotFitted("cannot serialize unfitted clustering")
         return {"kind": self.kind, "clusters": self.clusters, "max_iterations": self.max_iterations,
-                "tolerance": self.tolerance, "seed": self.seed, "features": [f.state() for f in self.features],
+                "tolerance": self.tolerance, "seed": self.seed, "mode": self.mode,
+                "features": [f.state() for f in self.features],
                 "centers": [list(row) for row in self.centers], "inertia": self.inertia,
                 "iterations": self.iterations}
 
     @classmethod
     def restore(cls, state):
         result = cls(state["clusters"], state["max_iterations"], state["tolerance"], state["seed"])
+        result.mode = state.get("mode", "complete")
+        if result.mode not in {"complete", "partial"}:
+            raise StateError("invalid clustering support mode")
         result.features = tuple(Feature(**f) for f in state["features"])
         result.centers = la.matrix(state["centers"])
         if la.shape(result.centers) != (result.clusters, len(result.features)):

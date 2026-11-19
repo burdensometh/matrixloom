@@ -47,7 +47,14 @@ class Analysis:
         table = self.store.load_table(dataset_name, info["revision"])
         clusterer = Clusterer(feature_spec, model_spec).fit(table)
         saved = self.store.save_bundle(model_name, clusterer, (dataset_name, info["revision"]), expected_model_revision)
-        return {**saved, "assignments": clusterer.predict(table), "inertia": clusterer.model.inertia}
+        assignments = clusterer.predict(table)
+        unassignable = sorted(key for key, value in assignments.items() if not value.get("assignable", True))
+        return {**saved, "assignments": assignments,
+                "support_mode": clusterer.model.mode,
+                "objective": clusterer.model.inertia,
+                "inertia": clusterer.model.inertia,
+                "assignable_rows": len(assignments) - len(unassignable),
+                "unassignable_ids": unassignable}
 
     def predict(self, model_name, dataset_name, model_revision=None, dataset_revision=None):
         bundle = self.store.load_bundle(model_name, model_revision)
@@ -126,7 +133,10 @@ class Analysis:
         table = self.store.load_table(dataset_name, dataset_revision)
         assignments = model.predict(table)
         frame = model.features.transform(table)
-        return silhouette(frame, {key: value["cluster"] for key, value in assignments.items()})
+        result = silhouette(frame, {key: value["cluster"] for key, value in assignments.items()})
+        result["unassignable_ids"] = sorted(
+            key for key, value in assignments.items() if not value.get("assignable", True))
+        return result
 
     def category_frequencies(self, dataset_name, fields, dataset_revision=None):
         table = self.store.load_table(dataset_name, dataset_revision)
