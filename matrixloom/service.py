@@ -5,7 +5,8 @@ from .errors import SchemaError
 from .evaluation import holdout, score, learning_curve, permutation_importance, targets
 from .frame import numerical_frame
 from .metrics import compare, silhouette
-from .pipeline import Features, Predictor, Clusterer
+from .pipeline import Features, Predictor, Clusterer, create_features
+from .graph import FeatureGraph
 from .splits import random_split
 from .statistics import summarize, covariance_matrix, frequency
 from .storage import Store
@@ -115,9 +116,29 @@ class Analysis:
 
     def encoded(self, dataset_name, feature_spec, dataset_revision=None):
         table = self.store.load_table(dataset_name, dataset_revision)
-        features = Features(**feature_spec)
+        features = create_features(feature_spec)
         frame = features.fit_transform(table)
         return {"frame": frame, "pipeline": features, "description": features.describe()}
+
+    def graph(self, name, dataset_name, nodes, outputs=None, derivations=(),
+              dataset_revision=None, expected_model_revision=None):
+        """Fit a shared-node feature graph and persist its frozen state."""
+
+        info = self.store.table_info(dataset_name, dataset_revision)
+        table = self.store.load_table(dataset_name, info["revision"])
+        graph = FeatureGraph(nodes, outputs, derivations).fit(table)
+        saved = self.store.save_bundle(name, graph, (dataset_name, info["revision"]), expected_model_revision)
+        return {**saved, "training_rows": len(table), "features": graph.describe()}
+
+    def graph_frame(self, name, dataset_name, model_revision=None, dataset_revision=None):
+        """Apply a persisted graph's frozen state to a dataset."""
+
+        graph = self.store.load_bundle(name, model_revision)
+        if not isinstance(graph, FeatureGraph):
+            raise SchemaError("graph application requires a feature graph bundle")
+        table = self.store.load_table(dataset_name, dataset_revision)
+        return {"frame": graph.transform(table), "pipeline": graph,
+                "description": graph.describe()}
 
     def cluster_quality(self, model_name, dataset_name, model_revision=None, dataset_revision=None):
         model = self.store.load_bundle(model_name, model_revision)

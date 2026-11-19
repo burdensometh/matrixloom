@@ -5,6 +5,7 @@ from .errors import NotFitted, SchemaError, StateError
 from .estimators import KMeans, create_model, restore_model
 from .expressions import Derivations
 from .frame import Feature
+from .graph import FeatureGraph
 from .schema import fingerprint
 from .transforms import create_transform, restore_transform
 
@@ -92,6 +93,34 @@ class Features:
         return result
 
 
+def is_graph_spec(spec):
+    return isinstance(spec, dict) and (spec.get("kind") == "graph" or "nodes" in spec)
+
+
+def create_features(spec):
+    """Build an unfitted feature plan from either a sequential or graph spec."""
+
+    spec = copy.deepcopy(spec)
+    if is_graph_spec(spec):
+        if spec.get("kind", "graph") != "graph":
+            raise SchemaError("unsupported feature graph kind")
+        options = {key: value for key, value in spec.items() if key != "kind"}
+        try:
+            return FeatureGraph(**options)
+        except TypeError as error:
+            raise SchemaError("unknown feature graph option") from error
+    try:
+        return Features(**spec)
+    except TypeError as error:
+        raise SchemaError("unknown feature pipeline option") from error
+
+
+def restore_features(state):
+    if isinstance(state, dict) and state.get("kind") == "graph":
+        return FeatureGraph.restore(state)
+    return Features.restore(state)
+
+
 class Predictor:
     def __init__(self, feature_spec, model_spec, target):
         self.feature_spec = copy.deepcopy(feature_spec)
@@ -109,7 +138,7 @@ class Predictor:
         targets = dict(zip(table.ids(), table.column(self.target)))
         if any(value is None for value in targets.values()):
             raise SchemaError("training labels cannot be missing")
-        features = Features(**self.feature_spec)
+        features = create_features(self.feature_spec)
         frame = features.fit_transform(table)
         model = create_model(self.model_spec)
         if isinstance(model, KMeans):
@@ -147,7 +176,7 @@ class Predictor:
         if state.get("version") != 1 or state.get("kind") != "predictor":
             raise StateError("unsupported predictor bundle")
         result = cls(state["feature_spec"], state["model_spec"], state["target"])
-        result.features = Features.restore(state["features"])
+        result.features = restore_features(state["features"])
         result.model = restore_model(state["model"])
         result.training_ids = tuple(state["training_ids"])
         result.training_digest = state["training_digest"]
@@ -167,7 +196,7 @@ class Clusterer:
         self.training_digest = None
 
     def fit(self, table):
-        features = Features(**self.feature_spec)
+        features = create_features(self.feature_spec)
         frame = features.fit_transform(table)
         model = create_model(self.model_spec)
         if not isinstance(model, KMeans):
@@ -195,7 +224,7 @@ class Clusterer:
         if state.get("version") != 1 or state.get("kind") != "clusterer":
             raise StateError("unsupported clusterer bundle")
         result = cls(state["feature_spec"], state["model_spec"])
-        result.features = Features.restore(state["features"])
+        result.features = restore_features(state["features"])
         result.model = restore_model(state["model"])
         result.training_digest = state["training_digest"]
         if not isinstance(result.model, KMeans) or result.features.output_features != result.model.features:
@@ -208,4 +237,6 @@ def restore_bundle(state):
         return Predictor.restore(state)
     if state.get("kind") == "clusterer":
         return Clusterer.restore(state)
+    if state.get("kind") == "graph":
+        return FeatureGraph.restore(state)
     raise StateError("unknown analysis bundle kind")

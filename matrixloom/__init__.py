@@ -3,5 +3,6 @@ from .service import Analysis
 from .table import Table
 from .schema import Field, Schema
 from .frame import Frame
+from .graph import FeatureGraph
 
-__all__ = ["Analysis", "Table", "Field", "Schema", "Frame"]
+__all__ = ["Analysis", "Table", "Field", "Schema", "Frame", "FeatureGraph"]

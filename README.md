@@ -11,16 +11,16 @@ Python 3.11 or newer, with no runtime dependencies:
 ```sh
 python3 -m unittest discover -s tests -v
 python3 examples/analyze_batch.py /tmp/matrixloom-example
+python3 examples/feature_graph.py /tmp/matrixloom-graph
 ```
 
-The example builds a small batch, fits a pipeline, closes and reopens its model, then computes predictions and evaluation results from the saved state. The output directory should be new when running the example for the first time.
+The example builds a small batch, fits a pipeline, closes and reopens its model, then computes predictions and evaluation results from the saved state. `examples/feature_graph.py` does the same with a branching graph. The output directories should be new when running an example for the first time.
 
 ## Data contracts
 
 - `Field.id` is stable identity; `Field.name` is a display label. A field also declares type, role, nullability, and optional measurement unit.
 - Samples have unique string identities and finite, nonnegative population weights. Missing observations are `None`, not zero. Tables reject duplicate sample identities.
-- `Frame` is an immutable dense numerical matrix. Every column has a `Feature` recording identity, source, operation, and unit. Reordering a compatible feature axis is allowed; changed lineage or units are rejected.
-- JSONL uses `_sample_id` and `_weight`. CSV includes the same columns. CSV null is `\N`; a literal string beginning with a backslash receives an extra leading backslash. An empty categorical string is preserved.
+- `Frame` is an immutable dense numerical matrix. Every column has a `Feature` recording identity, source, operation, and unit. Reordering a compatible feature axis is allowed; changed lineage or units are rejected.- JSONL uses `_sample_id` and `_weight`. CSV includes the same columns. CSV null is `\N`; a literal string beginning with a backslash receives an extra leading backslash. An empty categorical string is preserved.
 - Timestamps require a timezone and are normalized to UTC. Numeric model calculations use floating-point arithmetic. Integer fields preserve ordinary integral input; model feature extraction converts numerical values to floating point.
 
 ## Fitting and prediction
@@ -28,6 +28,34 @@ The example builds a small batch, fits a pipeline, closes and reopens its model,
 `Features` derives row expressions, fits an `Encoder`, then fits a sequential set of numerical transforms. `Predictor` adds a supervised estimator; `Clusterer` adds an unsupervised estimator. Fitted transforms never learn new statistics during prediction. A failed fit leaves the previously fitted predictor state intact.
 
 Supported transform specifications are `impute`, `standardize`, `range`, `winsorize`, `polynomial`, and `select`. These stages preserve sample population. Category encoding is dense, with an explicit width budget and `error` or `zero` behavior for unseen nonmissing categories. A missing category produces unobserved encoded entries until an imputer handles them.
+
+### Feature graphs
+
+A sequential plan produces one output axis, so it cannot keep both a standardized branch and a nonlinear interaction branch. `FeatureGraph` expresses that shape explicitly. Each node declares its dependencies by identity:
+
+```python
+from matrixloom import FeatureGraph
+
+graph = FeatureGraph(
+    nodes=[
+        {"id": "raw", "kind": "source", "fields": ["x", "z"], "unknown": "zero"},
+        {"id": "numeric", "kind": "transform", "inputs": ["raw"],
+         "transform": {"kind": "standardize"}},
+        {"id": "expansion", "kind": "transform", "inputs": ["numeric"],
+         "transform": {"kind": "polynomial", "degree": 2, "interactions_only": True}},
+        {"id": "interaction", "kind": "transform", "inputs": ["expansion"],
+         "transform": {"kind": "select", "ids": ["product:" + canonical(["x", "z"])]}},
+        {"id": "joined", "kind": "merge", "inputs": ["numeric", "interaction"]},
+    ],
+    outputs=["joined"],
+)
+```
+
+Node kinds are `source` (encodes input fields), `transform` (fits one registered stage on its single input), `sequence` (wraps an existing sequential `Features` specification, so current plans can be embedded unchanged), and `merge` (joins branches). A node consumed by several nodes is fitted once and its frozen state is reused by every consumer. `Fit` learns only from the table passed to it; `transform` never re-learns.
+
+Graphs are validated before any node runs. Cycles, absent dependencies, unknown node options, and duplicated node identities are rejected at construction. Merge conflicts are rejected before fitting: merging requires identical sample populations and weights, aligns rows by sample identity rather than position, and refuses a feature identity contributed by two inputs, including categorical sources and deterministic polynomial/selector expansions. Ambiguity is reported instead of silently overwriting a column.
+
+Graphs serialize through `FeatureGraph.state()`/`FeatureGraph.restore()` and can be stored directly as analysis bundles (`Analysis.graph`, applied later with `Analysis.graph_frame`) or used as a predictor/clusterer feature specification by passing `{"kind": "graph", "nodes": [...], "outputs": [...]}`. Sequential specifications remain the default and still round-trip unchanged.
 
 Ridge minimizes weighted squared residuals plus `alpha * sum(beta**2)`, with an optional unpenalized intercept. The implementation uses a small dense normal system with scaled-pivot elimination and rejects singular systems. Logistic fitting uses a weighted penalized binary likelihood, Newton steps, and backtracking. Neighbors use complete-feature Euclidean distances, stable sample-id tie breaking, and optional distance weighting. KMeans requires complete observations and positive support for every output cluster.
 
