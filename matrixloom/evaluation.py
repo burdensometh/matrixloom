@@ -2,7 +2,7 @@ import math
 import random
 
 from .errors import IdentityError, NumericalError, SchemaError
-from .metrics import regression, grouped_regression
+from .metrics import regression, grouped_regression, grouped_paired_bootstrap
 from .pipeline import Predictor
 from .statistics import mean, quantile
 
@@ -102,6 +102,42 @@ def bootstrap_mean(values, repeats=500, level=.95, seed=0):
     return {"estimate": mean(values), "lower": quantile(estimates, tail),
             "upper": quantile(estimates, 1 - tail), "repeats": repeats, "seed": seed,
             "level": level, "resampling_unit": "independent_observation"}
+
+
+def grouped_comparison(table, left, right, group_field, metric="mae", repeats=1000,
+                        level=.95, seed=0):
+    """Compare two fixed predictors by group-level paired bootstrap.
+
+    The two predictors must share a target field, and predictions, targets, groups, and
+    weights must all cover exactly the same sample identities.  Anything else is rejected
+    rather than silently intersected, because dropping identities would change both the
+    point estimate and the resampling population.
+    """
+    if not isinstance(left, Predictor) or not isinstance(right, Predictor):
+        raise SchemaError("grouped comparison requires two predictors")
+    if left.target != right.target:
+        raise SchemaError("grouped comparison requires the same target field")
+    if group_field not in table.schema.ids():
+        raise IdentityError("group field is absent from the compared dataset")
+    truth = targets(table, left.target)
+    left_predictions = left.predict(table)
+    right_predictions = right.predict(table)
+    ids = set(table.ids())
+    if set(truth) != ids or set(left_predictions) != ids or set(right_predictions) != ids:
+        raise IdentityError("target, prediction, and dataset populations differ")
+    groups = dict(zip(table.ids(), table.column(group_field)))
+    if any(value is None for value in groups.values()):
+        raise SchemaError("grouped comparison cannot treat missing groups as a category")
+    weights = dict(zip(table.ids(), table.weights()))
+    result = grouped_paired_bootstrap(truth, left_predictions, right_predictions, groups,
+                                      weights, metric, repeats, level, seed, target=left.target)
+    result.update({"group_field": group_field,
+                   "predictions": {"left": left_predictions, "right": right_predictions},
+                   "target_values": truth, "group_membership": groups,
+                   "weights": weights, "population": list(table.ids()),
+                   "data_digest": table.digest(),
+                   "left_model_digest": left.digest(), "right_model_digest": right.digest()})
+    return result
 
 
 def classification_score(predictor, table, threshold=.5, group_field=None):

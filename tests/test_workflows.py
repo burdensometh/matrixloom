@@ -1,7 +1,9 @@
 import copy
 import json
 from pathlib import Path
+import random
 import sqlite3
+import statistics
 import tempfile
 import unittest
 
@@ -10,7 +12,21 @@ from matrixloom.table import Sample
 from matrixloom.errors import IdentityError, MatrixError, StateError
 from matrixloom.pipeline import Features, Predictor, Clusterer, restore_bundle
 from matrixloom.splits import Split, random_split, kfold, time_split, stratified_split
-from matrixloom.evaluation import bootstrap_mean, classification_score
+from matrixloom.evaluation import bootstrap_mean, classification_score, grouped_comparison
+from matrixloom.metrics import grouped_paired_bootstrap
+
+
+def clustered_observations():
+    """Four sites whose residuals are strongly correlated within each site."""
+    schema = Schema([Field("x", "Measurement"), Field("site", "Site", "category", role="group"),
+                     Field("y", "Response", role="target")])
+    samples = []
+    offsets = {"north": 0.0, "south": 5.0, "east": -3.0, "west": 1.5}
+    for site, offset in offsets.items():
+        for i in range(6):
+            x = float(i)
+            samples.append(Sample(f"{site}-{i:02}", (x, site, 2 * x + offset + (i % 2) * .1)))
+    return Table(schema, samples)
 
 
 def observations():
@@ -148,6 +164,160 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.app.collinearity("training", {"fields": ["x", "z"], "transforms": [{"kind": "impute"}]})["status"], "OK")
         self.assertIn("mae_difference", self.app.compare("training", "ridge", "neighbors"))
         self.assertGreaterEqual(self.app.neighbor_intervals("neighbors", "training")["metrics"]["coverage"], 0)
+
+    def test_grouped_paired_bootstrap_keeps_groups_and_weights(self):
+        table = clustered_observations()
+        app = Analysis(Path(self.temporary.name) / "clustered")
+        app.ingest("observations", table)
+        app.train("linear", "observations", {"fields": ["x"]}, {"kind": "ridge", "alpha": .1}, "y")
+        app.train("neighbors", "observations", {"fields": ["x"]},
+                  {"kind": "neighbors", "neighbors": 3}, "y")
+        result = app.compare_grouped("site-comparison", "observations", "linear", "neighbors",
+                                     "site", metric="mae", repeats=200, seed=11)
+        self.assertEqual(result["resampling_unit"], "group")
+        self.assertTrue(result["paired"])
+        self.assertEqual(result["seed"], 11)
+        self.assertEqual(set(result["groups"]), {"north", "south", "east", "west"})
+        self.assertEqual(result["observed_difference"],
+                         result["left"]["mae"] - result["right"]["mae"])
+        self.assertLessEqual(result["lower"], result["upper"])
+        self.assertEqual(len(result["replicate_differences"]), 200)
+        # Every group has positive weight, so no degenerate group is reported.
+        self.assertEqual(result["degenerate_groups"], {})
+        stored = app.store.comparison("site-comparison")
+        self.assertEqual(stored["requests"]["seed"], 11)
+        self.assertEqual(stored["requests"]["interval_convention"]["method"], "percentile")
+        self.assertEqual(stored["result"]["replicate_differences"], result["replicate_differences"])
+        replay = app.compare_grouped("site-comparison", "observations", "linear", "neighbors",
+                                     "site", metric="mae", repeats=200, seed=11)
+        self.assertTrue(replay["replayed"])
+        verified = app.replay_comparison("site-comparison")
+        self.assertTrue(verified["verified"])
+        self.assertEqual(verified["replicate_differences"], result["replicate_differences"])
+        self.assertEqual(verified["digest"], replay["digest"])
+        with self.assertRaises(StateError):
+            app.compare_grouped("site-comparison", "observations", "linear", "neighbors",
+                                "site", metric="mae", repeats=200, seed=12)
+
+    def test_grouped_bootstrap_uses_original_weights_and_repeats_groups(self):
+        truth = {"a": 0.0, "b": 0.0, "c": 10.0, "d": 10.0}
+        left = {"a": 1.0, "b": 1.0, "c": 9.0, "d": 9.0}
+        right = {"a": 2.0, "b": 2.0, "c": 8.0, "d": 8.0}
+        groups = {"a": "p", "b": "p", "c": "q", "d": "q"}
+        weights = {"a": 1.0, "b": 3.0, "c": 2.0, "d": 1.0}
+        result = grouped_paired_bootstrap(truth, left, right, groups, weights,
+                                          metric="mae", repeats=50, seed=4)
+        self.assertEqual(result["left"]["mae"], 1.0)
+        self.assertEqual(result["right"]["mae"], 2.0)
+        self.assertEqual(result["observed_difference"], -1.0)
+        self.assertTrue(all(value == -1.0 for value in result["replicate_differences"]))
+        self.assertEqual(sorted(result["eligible_groups"]), ["p", "q"])
+
+    def test_grouped_bootstrap_reports_degenerate_groups(self):
+        truth = {"a": 0.0, "b": 1.0, "c": 2.0}
+        left = {"a": 0.5, "b": 1.5, "c": 2.5}
+        right = {"a": 0.0, "b": 1.0, "c": 2.0}
+        groups = {"a": "kept", "b": "kept", "c": "zero-weight"}
+        weights = {"a": 1.0, "b": 1.0, "c": 0.0}
+        result = grouped_paired_bootstrap(truth, left, right, groups, weights,
+                                          metric="mae", repeats=20, seed=1)
+        self.assertIn("zero-weight", result["degenerate_groups"])
+        self.assertEqual(result["groups"]["zero-weight"]["status"], "NO_POSITIVE_WEIGHT")
+        self.assertEqual(result["groups"]["zero-weight"]["rows"], 1)
+        self.assertNotIn("zero-weight", result["eligible_groups"])
+        self.assertEqual(result["status"], "INSUFFICIENT_GROUPS")
+
+    def test_grouped_bootstrap_does_not_deduplicate_repeated_groups(self):
+        # Two groups with equal total weight and distinct paired losses.  Drawing the
+        # same group twice must reproduce that group's own difference (10 or 0), while a
+        # mixed draw yields the pooled difference (5).  A set-based implementation that
+        # collapsed repeated identities would only ever emit the pooled 5.
+        truth = {"p1": 0.0, "p2": 0.0, "q1": 0.0, "q2": 0.0}
+        left = {"p1": 0.0, "p2": 0.0, "q1": 10.0, "q2": 10.0}
+        right = {"p1": 0.0, "p2": 0.0, "q1": 0.0, "q2": 0.0}
+        groups = {"p1": "p", "p2": "p", "q1": "q", "q2": "q"}
+        result = grouped_paired_bootstrap(truth, left, right, groups, metric="mae",
+                                          repeats=400, seed=2)
+        observed = set(result["replicate_differences"])
+        self.assertIn(10.0, observed)    # q drawn twice: left - right = 10 - 0
+        self.assertIn(0.0, observed)     # p drawn twice
+        self.assertIn(5.0, observed)     # one p and one q pooled
+
+    def test_grouped_interval_exceeds_row_bootstrap_under_clustering(self):
+        truth, left, right, groups, weights = {}, {}, {}, {}, {}
+        for index, site in enumerate(["a", "b", "c", "d"]):
+            offset = float(index + 1)
+            for member in range(6):
+                key = f"{site}{member}"
+                truth[key] = 0.0
+                left[key] = offset
+                right[key] = 0.5 * offset
+                groups[key] = site
+                weights[key] = 1.0
+        grouped = grouped_paired_bootstrap(truth, left, right, groups, weights,
+                                           metric="mae", repeats=2000, seed=0)
+        generator = random.Random(0)
+        ids = list(truth)
+        row_differences = []
+        for _ in range(2000):
+            draw = [ids[generator.randrange(len(ids))] for _ in ids]
+            left_mae = sum(abs(truth[key] - left[key]) for key in draw) / len(draw)
+            right_mae = sum(abs(truth[key] - right[key]) for key in draw) / len(draw)
+            row_differences.append(left_mae - right_mae)
+        row_error = statistics.stdev(row_differences)
+        self.assertGreater(grouped["standard_error"], row_error * 2)
+
+    def test_grouped_bootstrap_is_reproducible_from_saved_seed(self):
+        truth = {"a": 0.0, "b": 1.0, "c": 2.0, "d": 4.0}
+        left = {"a": 0.5, "b": 0.5, "c": 2.5, "d": 3.0}
+        right = {"a": 0.0, "b": 0.0, "c": 2.0, "d": 3.0}
+        groups = {"a": "p", "b": "p", "c": "q", "d": "q"}
+        first = grouped_paired_bootstrap(truth, left, right, groups, metric="mae",
+                                         repeats=100, seed=17)
+        second = grouped_paired_bootstrap(truth, left, right, groups, metric="mae",
+                                          repeats=100, seed=17)
+        self.assertEqual(first["replicate_differences"], second["replicate_differences"])
+        self.assertEqual((first["lower"], first["upper"]), (second["lower"], second["upper"]))
+        self.assertEqual(first["interval_method"], "percentile")
+        self.assertEqual(first["interval_convention"], {"method": "percentile", "tails": "equal", "level": .95})
+
+    def test_grouped_comparison_rejects_population_mismatch(self):
+        table = clustered_observations()
+        app = Analysis(Path(self.temporary.name) / "mismatch")
+        app.ingest("observations", table)
+        app.train("linear", "observations", {"fields": ["x"]}, {"kind": "ridge", "alpha": .1}, "y")
+        with self.assertRaises(IdentityError):
+            app.compare_grouped("bad", "observations", "linear", "linear", "absent")
+        shifted = table.replace_column("y", [float(i) for i in range(len(table))])
+        app.ingest("shifted", shifted)
+        app.train("other", "shifted", {"fields": ["x"]}, {"kind": "ridge", "alpha": .1}, "y")
+        # Same target name but predictions are still over the same identities, so a
+        # direct population mismatch must be caught before resampling.
+        left = app.store.load_bundle("linear")
+        right = app.store.load_bundle("other")
+        broken = {key: value for key, value in left.predict(table).items() if key != "north-00"}
+        with self.assertRaises(IdentityError):
+            grouped_paired_bootstrap(dict(zip(table.ids(), table.column("y"))), broken,
+                                     right.predict(table),
+                                     dict(zip(table.ids(), table.column("site"))),
+                                     dict(zip(table.ids(), table.weights())))
+
+    def test_grouped_comparison_rejects_target_version_drift(self):
+        table = clustered_observations()
+        app = Analysis(Path(self.temporary.name) / "versions")
+        app.ingest("observations", table)
+        app.train("linear", "observations", {"fields": ["x"]}, {"kind": "ridge", "alpha": .1}, "y")
+        redefined = Table(
+            Schema([Field("x", "Measurement"), Field("site", "Site", "category", role="group"),
+                    Field("y", "Response", unit="kg", role="target")]), table.samples)
+        app.ingest("redefined", redefined)
+        app.train("kilogram", "redefined", {"fields": ["x"]}, {"kind": "ridge", "alpha": .1}, "y")
+        with self.assertRaises(IdentityError):
+            app.compare_grouped("drifted", "observations", "linear", "kilogram", "site",
+                                metric="mae", repeats=20, seed=0)
+        self.assertRaises(IdentityError, app.store.comparison, "drifted")
+
+
 
     def test_public_ingestion_paths(self):
         self.app.ingest_jsonl("json", self.table.schema, self.table.to_jsonl())

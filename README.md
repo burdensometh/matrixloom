@@ -50,14 +50,20 @@ analysis.train("model", "observations", {"fields": ["x"]}, {"kind": "ridge", "al
 predictions = analysis.predict("model", "observations")
 ```
 
-`Analysis.evaluate` persists an identity-bound evaluation; `classify` provides probability metrics; `compare`, `importance`, and `cluster_quality` consume actual model outputs. Prediction and regression scoring can read input data in batches, while fitted neighbor training data and dense preprocessing states remain in-memory structures in version 1.
+`Analysis.evaluate` persists an identity-bound evaluation; `classify` provides probability metrics; `compare`, `importance`, and `cluster_quality` consume actual model outputs. `compare_grouped` compares two fixed predictors with a group-level paired bootstrap and persists the interval, seed, and interval convention; `replay_comparison` recomputes a stored comparison from those records and rejects a digest mismatch. Prediction and regression scoring can read input data in batches, while fitted neighbor training data and dense preprocessing states remain in-memory structures in version 1.
 
 Random, stratified, temporal, and k-fold split constructors are available. `holdout` fits only its selected training rows. Bootstrap means assume independent observations. Unconditional permutation importance is descriptive and is not a grouped or causal estimate. Neighbor intervals are empirical summaries and have no coverage guarantee.
 
+## Grouped model comparison
+
+Rows from the same device or site are not independent, so a row-level bootstrap understates the uncertainty of a model comparison. `Analysis.compare_grouped` instead resamples whole groups: each replicate draws groups with replacement, keeps every sample of a drawn group (a repeated group contributes all of its samples again and is never collapsed by sample identity), applies the same draw to both models, and recomputes the MAE or RMSE difference with the original sample weights. The paired difference is defined as `left - right` and the reported `lower`/`upper` bounds are the percentile interval implied by `level`.
+
+Prediction, target, and group populations must match exactly; a mismatch is rejected rather than intersected. Both models must target the same field, and a model bound to a training dataset must pin the same target definition (kind, unit, role) as the comparison dataset. Groups with no positive weight are reported under `degenerate_groups` and excluded from resampling; fewer than two eligible groups yields status `INSUFFICIENT_GROUPS`. The result records `seed`, `repeats`, `level`, `interval_method`, and `interval_convention`, so the same draw can be replayed. `Analysis.replay_comparison` re-derives every replicate difference and verifies the stored digest.
+
 ## Persistence
 
-`Store` retains immutable dataset and model revisions. A dataset revision freezes schema, order, sample identities, values, weights, and digest. Model bundles bind the fitted preprocessing state and estimator state; optional dataset binding verifies the training digest. Evaluation ids are idempotent only for the same model, dataset revision, population, predictions, and metrics.
+`Store` retains immutable dataset and model revisions. A dataset revision freezes schema, order, sample identities, values, weights, and digest. Model bundles bind the fitted preprocessing state and estimator state; optional dataset binding verifies the training digest. Evaluation ids are idempotent only for the same model, dataset revision, population, predictions, and metrics. Comparison ids are idempotent only for the same dataset revision, model revisions, group field, metric, resampling request, and computed result.
 
 Version 1 stores sample rows as JSON arrays in SQLite and exports model bundles as a versioned JSON envelope. Bundle import validates its digest and reconstructs supported numerical states; it does not execute pickles or arbitrary code. Full table loading verifies its digest. Batched and selected-row reads validate structure and population but do not independently recompute the full dataset digest.
 
-The tests include hand-computed matrix solutions, weighted-population checks, identity reordering, missing-data populations, serialization round trips, corruption rejection, fitted-state isolation, and end-to-end reopen/evaluation workflows.
+The tests include hand-computed matrix solutions, weighted-population checks, identity reordering, missing-data populations, serialization round trips, corruption rejection, fitted-state isolation, end-to-end reopen/evaluation workflows, and grouped-bootstrap interval and replay checks.

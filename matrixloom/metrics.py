@@ -1,8 +1,9 @@
 import math
+import random
 
 from .errors import IdentityError, NumericalError, SchemaError
 from .schema import finite
-from .statistics import mean, quantile, effective_sample_size
+from .statistics import mean, quantile, effective_sample_size, standard_deviation
 
 
 def aligned(truth, predictions, weights=None, require_positive=True):
@@ -78,6 +79,147 @@ def compare(truth, left, right, weights=None):
     return {"left": regression(truth, left, weights), "right": regression(truth, right, weights),
             "mae_difference": mean(differences, weight),
             "paired_differences": {row[0]: value for row, value in zip(left_rows, differences)}}
+
+
+def grouped_paired_bootstrap(truth, left, right, groups, weights=None, metric="mae",
+                             repeats=1000, level=.95, seed=0, target=None):
+    """Group-level paired bootstrap for the difference between two fixed predictions.
+
+    Groups are drawn with replacement and every sample belonging to a drawn group is
+    retained, including all repetitions of a group.  Both predictions are evaluated on
+    exactly the same draw, so the paired difference is not contaminated by independent
+    resampling noise.  Original sample weights are used unchanged.  Repeated sample
+    identities are intentionally *not* deduplicated.
+    """
+    if metric not in {"mae", "rmse"}:
+        raise SchemaError("grouped comparison metric must be 'mae' or 'rmse'")
+    if type(repeats) is not int or repeats < 2:
+        raise SchemaError("grouped bootstrap repetitions must be an integer of at least two")
+    level = finite(level, "grouped bootstrap level")
+    if not 0 < level < 1:
+        raise SchemaError("grouped bootstrap level must lie inside (0,1)")
+    if type(seed) is not int:
+        raise SchemaError("grouped bootstrap seed must be an integer")
+    if target is not None and (not isinstance(target, str) or not target):
+        raise SchemaError("grouped comparison target identity must be nonempty text")
+
+    # Validation happens through aligned() so prediction identity and weight
+    # populations cannot silently diverge.  Both models must match truth exactly.
+    left_rows = aligned(truth, left, weights)
+    right_rows = aligned(truth, right, weights)
+    if set(left) != set(right):
+        raise IdentityError("left and right prediction populations differ")
+    if set(groups) != set(truth):
+        raise IdentityError("group population differs from prediction and target populations")
+
+    # Index right predictions by identity: aligned() preserves each mapping's own
+    # insertion order, so zipping the two row lists could otherwise pair mismatched keys.
+    right_by_key = {key: prediction for key, _, prediction, _ in right_rows}
+    rows = {key: (y, pl, right_by_key[key], w) for key, y, pl, w in left_rows}
+
+    buckets = {}
+    for key in truth:
+        group = groups[key]
+        if not isinstance(group, str) or not group:
+            raise SchemaError("grouped bootstrap groups must be nonempty strings")
+        buckets.setdefault(group, []).append(key)
+
+    group_stats = {}
+    degenerate = {}
+    for group in sorted(buckets):
+        keys = buckets[group]
+        weight = math.fsum(rows[key][3] for key in keys)
+        positive = sum(rows[key][3] > 0 for key in keys)
+        stats = {"rows": len(keys), "positive_rows": positive, "weight": weight,
+                 "status": "OK", "singleton": len(keys) == 1}
+        if weight <= 0:
+            stats["status"] = "NO_POSITIVE_WEIGHT"
+            degenerate[group] = dict(stats)
+        else:
+            stats["left_mae"] = math.fsum(
+                rows[key][3] * abs(rows[key][0] - rows[key][1]) for key in keys) / weight
+            stats["right_mae"] = math.fsum(
+                rows[key][3] * abs(rows[key][0] - rows[key][2]) for key in keys) / weight
+            stats["left_rmse"] = math.sqrt(math.fsum(
+                rows[key][3] * (rows[key][0] - rows[key][1]) ** 2 for key in keys) / weight)
+            stats["right_rmse"] = math.sqrt(math.fsum(
+                rows[key][3] * (rows[key][0] - rows[key][2]) ** 2 for key in keys) / weight)
+        group_stats[group] = stats
+
+    eligible = [group for group in sorted(buckets) if group_stats[group]["status"] == "OK"]
+    if not eligible:
+        raise NumericalError("grouped bootstrap has no group with positive weight")
+
+    contributions = {}
+    for group in eligible:
+        keys = buckets[group]
+        weight = group_stats[group]["weight"]
+        left_additive = math.fsum(rows[key][3] * (abs(rows[key][0] - rows[key][1])
+                                  if metric == "mae" else (rows[key][0] - rows[key][1]) ** 2)
+                                  for key in keys)
+        right_additive = math.fsum(rows[key][3] * (abs(rows[key][0] - rows[key][2])
+                                   if metric == "mae" else (rows[key][0] - rows[key][2]) ** 2)
+                                   for key in keys)
+        contributions[group] = (weight, left_additive, right_additive)
+
+    generator = random.Random(seed)
+    differences = []
+    for _ in range(repeats):
+        total_weight = 0.0
+        left_total = 0.0
+        right_total = 0.0
+        # Draw len(eligible) groups with replacement.  A repeated group contributes
+        # all of its samples again; nothing is collapsed by sample identity.
+        for _ in range(len(eligible)):
+            group = eligible[generator.randrange(len(eligible))]
+            weight, left_additive, right_additive = contributions[group]
+            total_weight += weight
+            left_total += left_additive
+            right_total += right_additive
+        if total_weight <= 0:
+            raise NumericalError("grouped bootstrap draw has no positive weight")
+        left_loss = left_total / total_weight
+        right_loss = right_total / total_weight
+        if metric == "rmse":
+            left_loss = math.sqrt(left_loss)
+            right_loss = math.sqrt(right_loss)
+        differences.append(left_loss - right_loss)
+
+    left_metric = regression(truth, left, weights)
+    right_metric = regression(truth, right, weights)
+    observed = left_metric[metric] - right_metric[metric]
+    mean_difference = mean(differences)
+    deviation = standard_deviation(differences, ddof=1)
+    tail = (1 - level) / 2
+    lower = quantile(differences, tail)
+    upper = quantile(differences, 1 - tail)
+    status = "OK" if len(eligible) >= 2 else "INSUFFICIENT_GROUPS"
+
+    return {
+        "metric": metric,
+        "target": target,
+        "left": left_metric,
+        "right": right_metric,
+        "observed_difference": observed,
+        "difference_definition": "left_minus_right",
+        "mean_difference": mean_difference,
+        "bias": mean_difference - observed,
+        "standard_error": deviation,
+        "lower": lower,
+        "upper": upper,
+        "level": level,
+        "repeats": repeats,
+        "seed": seed,
+        "interval_method": "percentile",
+        "interval_convention": {"method": "percentile", "tails": "equal", "level": level},
+        "resampling_unit": "group",
+        "paired": True,
+        "status": status,
+        "groups": group_stats,
+        "degenerate_groups": degenerate,
+        "eligible_groups": eligible,
+        "replicate_differences": differences,
+    }
 
 
 def binary(truth, probabilities, threshold=.5, weights=None):

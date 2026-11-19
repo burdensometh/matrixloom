@@ -1,11 +1,13 @@
 from pathlib import Path
 
 from .diagnostics import associations, collinearity, drift, missing_by_group, outliers
-from .errors import SchemaError
-from .evaluation import holdout, score, learning_curve, permutation_importance, targets
+from .errors import SchemaError, StateError
+from .evaluation import (holdout, score, learning_curve, permutation_importance,
+                         grouped_comparison, targets)
 from .frame import numerical_frame
 from .metrics import compare, silhouette
 from .pipeline import Features, Predictor, Clusterer
+from .schema import fingerprint
 from .splits import random_split
 from .statistics import summarize, covariance_matrix, frequency
 from .storage import Store
@@ -88,6 +90,65 @@ class Analysis:
             raise SchemaError("model comparison requires two predictors for the same target")
         return compare(targets(table, left.target), left.predict(table), right.predict(table),
                        dict(zip(table.ids(), table.weights())))
+
+    def compare_grouped(self, comparison_id, dataset_name, left_name, right_name, group_field,
+                        metric="mae", repeats=1000, level=.95, seed=0, dataset_revision=None,
+                        left_revision=None, right_revision=None):
+        """Run and persist a group-level paired bootstrap comparison of two fixed models.
+
+        Cluster-correlated errors make the row-level bootstrap too narrow, so entire
+        groups are resampled with replacement and every member of a drawn group is kept.
+        Both models share each draw, and the original sample weights are reused.
+        """
+        data_info = self.store.table_info(dataset_name, dataset_revision)
+        left_info = self.store.bundle_info(left_name, left_revision)
+        right_info = self.store.bundle_info(right_name, right_revision)
+        left = self.store.load_bundle(left_name, left_info["revision"])
+        right = self.store.load_bundle(right_name, right_info["revision"])
+        table = self.store.load_table(dataset_name, data_info["revision"])
+        result = grouped_comparison(table, left, right, group_field, metric, repeats, level, seed)
+        # Derive the replay request from the validated result so a stored record always
+        # reproduces exactly what was computed, not an unconverted caller argument.
+        requests = {"metric": result["metric"], "group_field": group_field,
+                    "repeats": result["repeats"], "level": result["level"],
+                    "seed": result["seed"], "target": result["target"],
+                    "interval_method": result["interval_method"],
+                    "interval_convention": result["interval_convention"],
+                    "difference_definition": result["difference_definition"],
+                    "resampling_unit": result["resampling_unit"], "paired": result["paired"]}
+        saved = self.store.save_comparison(comparison_id,
+                    (dataset_name, data_info["revision"]),
+                    (left_name, left_info["revision"]),
+                    (right_name, right_info["revision"]),
+                    group_field, metric, requests, result, result["population"])
+        return {**result, **saved}
+
+    def replay_comparison(self, comparison_id):
+        """Rebuild a stored grouped comparison from its pinned seed and interval settings.
+
+        The recomputation must reproduce the stored digest exactly; otherwise the record
+        is treated as corrupt rather than reported as a verified replay.
+        """
+        stored = self.store.comparison(comparison_id)
+        requests = stored["requests"]
+        dataset_name, dataset_revision = stored["dataset"]
+        left_name, left_revision = stored["left"]
+        right_name, right_revision = stored["right"]
+        left = self.store.load_bundle(left_name, left_revision)
+        right = self.store.load_bundle(right_name, right_revision)
+        table = self.store.load_table(dataset_name, dataset_revision)
+        recomputed = grouped_comparison(table, left, right, requests["group_field"],
+                                        requests["metric"], requests["repeats"],
+                                        requests["level"], requests["seed"])
+        payload = {"dataset": [dataset_name, dataset_revision],
+                   "left": [left_name, left_revision], "right": [right_name, right_revision],
+                   "metric": requests["metric"], "group_field": requests["group_field"],
+                   "population_digest": stored["population_digest"],
+                   "requests": requests, "result": recomputed}
+        if fingerprint(payload) != stored["digest"]:
+            raise StateError("stored comparison replay does not reproduce its digest")
+        return {**recomputed, "comparison_id": comparison_id, "replayed": True,
+                "verified": True, "digest": stored["digest"]}
 
     def holdout(self, dataset_name, feature_spec, model_spec, target, split=None,
                 dataset_revision=None, seed=0, test_fraction=.2, group_field=None):

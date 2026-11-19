@@ -57,6 +57,25 @@ CREATE TABLE IF NOT EXISTS evaluations (
   FOREIGN KEY(bundle_name,bundle_revision) REFERENCES bundles(name,revision),
   FOREIGN KEY(dataset_name,dataset_revision) REFERENCES datasets(name,revision)
 );
+CREATE TABLE IF NOT EXISTS comparisons (
+  comparison_id TEXT PRIMARY KEY,
+  dataset_name TEXT NOT NULL,
+  dataset_revision INTEGER NOT NULL,
+  left_name TEXT NOT NULL,
+  left_revision INTEGER NOT NULL,
+  right_name TEXT NOT NULL,
+  right_revision INTEGER NOT NULL,
+  metric TEXT NOT NULL,
+  group_field TEXT NOT NULL,
+  population_digest TEXT NOT NULL,
+  requests_json TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(dataset_name,dataset_revision) REFERENCES datasets(name,revision),
+  FOREIGN KEY(left_name,left_revision) REFERENCES bundles(name,revision),
+  FOREIGN KEY(right_name,right_revision) REFERENCES bundles(name,revision)
+);
 """
 
 
@@ -265,6 +284,91 @@ class Store:
             if fingerprint(payload) != row["digest"]:
                 raise StateError("stored evaluation integrity check failed")
             return {"run_id": run_id, "digest": row["digest"], **payload}
+        finally:
+            connection.close()
+
+    def save_comparison(self, comparison_id, dataset_ref, left_ref, right_ref, group_field,
+                        metric, requests, result, population):
+        """Persist a grouped paired comparison with its seed and interval convention.
+
+        Replaying the same identifier with identical request and result payloads is
+        idempotent; any drift in the resampling configuration or computed statistics is
+        rejected so a stored interval can always be reproduced from its own records.
+        """
+        name(comparison_id)
+        dataset_name, dataset_revision = dataset_ref
+        left_name, left_revision = left_ref
+        right_name, right_revision = right_ref
+        name(group_field)
+        population = tuple(population)
+        if len(set(population)) != len(population):
+            raise IdentityError("comparison population contains duplicate sample identities")
+        with self.transaction() as connection:
+            dataset = self._dataset(connection, dataset_name, dataset_revision)
+            left, left_state = self._bundle(connection, left_name, left_revision)
+            right, right_state = self._bundle(connection, right_name, right_revision)
+            # Both models must target the same declared field; differing targets would
+            # make the paired difference meaningless even if sample identities align.
+            if left_state.get("target") != right_state.get("target"):
+                raise IdentityError("compared models do not share a target field")
+            target_field = left_state["target"]
+            dataset_schema = Schema.restore(json.loads(dataset["schema_json"]))
+            if target_field not in dataset_schema.ids():
+                raise IdentityError("comparison dataset lacks the compared target field")
+            target_definition = dataset_schema.field(target_field).state()
+            # A model bound to a training dataset pins the target's declared version;
+            # a later change of kind, unit, or role must not be silently compared.
+            for label, bundle in (("left", left), ("right", right)):
+                if bundle["dataset_name"] is None:
+                    continue
+                training = self._dataset(connection, bundle["dataset_name"], bundle["dataset_revision"])
+                training_schema = Schema.restore(json.loads(training["schema_json"]))
+                if target_field not in training_schema.ids():
+                    raise IdentityError(f"{label} model target is absent from its training dataset")
+                if training_schema.field(target_field).state() != target_definition:
+                    raise IdentityError(f"{label} model target version differs from the comparison dataset")
+            ids = {row[0] for row in connection.execute(
+                "SELECT sample_id FROM samples WHERE dataset_name=? AND revision=?",
+                (dataset_name, dataset["revision"]))}
+            if set(population) != ids:
+                raise IdentityError("comparison population differs from the bound dataset")
+            population_digest = fingerprint(sorted(ids))
+            requests = dict(requests)
+            payload = {"dataset": [dataset_name, dataset["revision"]],
+                       "left": [left_name, left["revision"]], "right": [right_name, right["revision"]],
+                       "metric": metric, "group_field": group_field,
+                       "population_digest": population_digest,
+                       "requests": requests, "result": result}
+            digest = fingerprint(payload)
+            old = connection.execute(
+                "SELECT digest FROM comparisons WHERE comparison_id=?", (comparison_id,)).fetchone()
+            if old is not None:
+                if old["digest"] != digest:
+                    raise StateError("comparison id already binds a different result")
+                return {"comparison_id": comparison_id, "replayed": True, "digest": digest}
+            connection.execute("INSERT INTO comparisons VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (comparison_id, dataset_name, dataset["revision"], left_name, left["revision"],
+                 right_name, right["revision"], metric, group_field, population_digest,
+                 canonical(requests), canonical(result), digest, now()))
+        return {"comparison_id": comparison_id, "replayed": False, "digest": digest}
+
+    def comparison(self, comparison_id):
+        connection = self.connect()
+        try:
+            row = connection.execute("SELECT * FROM comparisons WHERE comparison_id=?",
+                                     (name(comparison_id),)).fetchone()
+            if row is None:
+                raise IdentityError("comparison does not exist")
+            payload = {"dataset": [row["dataset_name"], row["dataset_revision"]],
+                       "left": [row["left_name"], row["left_revision"]],
+                       "right": [row["right_name"], row["right_revision"]],
+                       "metric": row["metric"], "group_field": row["group_field"],
+                       "population_digest": row["population_digest"],
+                       "requests": json.loads(row["requests_json"]),
+                       "result": json.loads(row["result_json"])}
+            if fingerprint(payload) != row["digest"]:
+                raise StateError("stored comparison integrity check failed")
+            return {"comparison_id": comparison_id, "digest": row["digest"], **payload}
         finally:
             connection.close()
 
